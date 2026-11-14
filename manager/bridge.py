@@ -80,7 +80,7 @@ class Bridge:
         except Exception as e:  # noqa: BLE001
             print("[bridge] 保存 topics 失败:", e, flush=True)
 
-    async def _topic_for(self, chat_id: str, chat_name: str) -> int | None:
+    async def _topic_for(self, chat_id: str, chat_name: str, number: str = "") -> int | None:
         hit = self.map.get(chat_id)
         if hit:
             return hit["topic_id"]
@@ -91,13 +91,13 @@ class Bridge:
             if hit:
                 return hit["topic_id"]
             try:
-                t = await self.app.bot.create_forum_topic(self.chat_id, name=(chat_name or chat_id)[:120])
+                t = await self.app.bot.create_forum_topic(self.chat_id, name=(chat_name or number or chat_id)[:120])
                 tid = t.message_thread_id
             except Exception as e:  # noqa: BLE001
                 self._forum_ok = False
                 print(f"[bridge] 建 topic 失败（群是否开启 Topics？bot 是否管理员且有管理话题权限？）: {e}", flush=True)
                 return None
-            self.map[chat_id] = {"topic_id": tid, "name": chat_name}
+            self.map[chat_id] = {"topic_id": tid, "name": chat_name, "number": number}
             self.rev[tid] = chat_id
             self._save_topics()
             try:
@@ -116,7 +116,7 @@ class Bridge:
 
     async def _send_tg(self, m: Message):
         try:
-            tid = await self._topic_for(m.chat_id, m.chat_name)
+            tid = await self._topic_for(m.chat_id, m.chat_name, m.chat_number)
             text = m.text or ""
             if m.is_group and m.sender_name:
                 text = f"{m.sender_name}:\n{text}"
@@ -141,8 +141,9 @@ class Bridge:
         chat_id = self.rev.get(tid) if tid else None
         if not chat_id:
             return
-        name = self.map[chat_id]["name"]
-        r = await asyncio.to_thread(send.send_to_chat, name, chat_id, msg.text)
+        info = self.map[chat_id]
+        number = info.get("number") or info.get("name")   # 发送按号码定位
+        r = await asyncio.to_thread(send.send_to_chat, number, chat_id, msg.text)
         if r.get("ok"):
             self._recent_sent.append((chat_id, self._norm(msg.text), time.time()))
         else:
@@ -158,10 +159,35 @@ class Bridge:
         lines = [("👥 " if r["is_group"] else "👤 ") + r["name"] for r in rows]
         await update.effective_message.reply_text("最近会话：\n" + "\n".join(lines[:40]))
 
+    async def cmd_synctopic(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """手动重同步昵称/群名 → 刷新映射并把已建 topic 改名（昵称/群名会变）。"""
+        m = update.effective_message
+        await m.reply_text("🔄 正在重新同步昵称/群名…")
+        ok = await asyncio.to_thread(self.col.names.refresh)
+        if not ok:
+            await m.reply_text("❌ 同步失败：未能解密 group_info/profile_info（QQ 是否已登录？）")
+            return
+        renamed = 0
+        for chat_id, info in list(self.map.items()):
+            is_group = not str(chat_id).startswith("u_")
+            number = info.get("number") or info.get("name")
+            new_name = self.col.names.display(chat_id, is_group, number) or number
+            if new_name and new_name != info.get("name"):
+                try:
+                    await self.app.bot.edit_forum_topic(
+                        self.chat_id, info["topic_id"], name=new_name[:120])
+                    info["name"] = new_name
+                    renamed += 1
+                except Exception as e:  # noqa: BLE001
+                    print("[bridge] 改 topic 名失败:", e, flush=True)
+        self._save_topics()
+        await m.reply_text(f"✅ 同步完成，更新了 {renamed} 个话题名称。")
+
     # -------------------------------------------------- 运行
     async def run(self):
         self.app = Application.builder().token(self.cfg["tg_bot_token"]).build()
         self.app.add_handler(CommandHandler("contacts", self.cmd_contacts, filters.Chat(self.chat_id)))
+        self.app.add_handler(CommandHandler("synctopic", self.cmd_synctopic, filters.Chat(self.chat_id)))
         self.app.add_handler(MessageHandler(
             filters.Chat(self.chat_id) & filters.TEXT & ~filters.COMMAND, self.on_tg_message))
         self.loop = asyncio.get_running_loop()
@@ -171,7 +197,10 @@ class Bridge:
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)
         try:
-            await self.app.bot.set_my_commands([BotCommand("contacts", "最近会话（可带关键词）")])
+            await self.app.bot.set_my_commands([
+                BotCommand("contacts", "最近会话（可带关键词）"),
+                BotCommand("synctopic", "重新同步昵称/群名到话题标题"),
+            ])
         except Exception as e:  # noqa: BLE001
             print("设置命令菜单失败:", e, flush=True)
         try:

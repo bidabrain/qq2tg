@@ -216,11 +216,12 @@ def _try_open(clear_db: str, cand: dict, only_variant: str | None = None):
             cur.execute(key_stmt)
             for e in extras:
                 cur.execute(e)
+            # 密钥对则能读出表结构；密钥错会在这里抛 "file is not a database"。
+            # 不用 integrity_check 校验：group_info/profile_info 用了自定义 FTS 分词器
+            # (pinyin_letter)，integrity_check 会在那些 FTS 表上报错，但库本身已正常解密。
             n = cur.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
-            if n >= 0:
-                ic = cur.execute("PRAGMA integrity_check").fetchone()[0]
-                if ic == "ok":
-                    return con, tag
+            if n >= 1:
+                return con, tag
             con.close()
         except Exception:  # noqa: BLE001
             try:
@@ -248,19 +249,26 @@ def _sync_wal(db_path: str, clear: str):
         pass
 
 
+def _clear_name(db_path: str) -> str:
+    return os.path.basename(db_path).replace(".db", "") + "_clear.db"
+
+
 def find_working_key(db_path: str, work_dir: str, pid: int | None = None,
                      try_ascii: bool = True) -> dict | None:
-    """扫描内存 + 逐候选试开，返回命中的 {key, kind, variant, salt} 或 None。"""
+    """扫描内存 + 逐候选试开，返回命中的 {key, kind, variant, salt} 或 None。
+    NTQQ 每个库密钥不同，故按该库文件头 salt 优先匹配候选（避免用错别的库的密钥）。"""
     pid = pid or find_qq_pid()
     if not pid:
         return None
     salt_hex = read_salt(db_path)
     os.makedirs(work_dir, exist_ok=True)
-    clear = strip_header(db_path, os.path.join(work_dir, "nt_msg_clear.db"))
+    clear = strip_header(db_path, os.path.join(work_dir, _clear_name(db_path)))
     _sync_wal(db_path, clear)
 
     cands = scan_memory_candidates(pid, salt_hex)
-    for c in cands:
+    # salt 对得上的候选最可信，优先；scan 已按 salt_match 排序，这里再强约束一次
+    ordered = [c for c in cands if c.get("salt_match")] + [c for c in cands if not c.get("salt_match")]
+    for c in ordered:
         con, variant = _try_open(clear, c)
         if con:
             con.close()
@@ -284,6 +292,14 @@ def open_decrypted(db_path: str, cred: dict, work_dir: str, name: str = "nt_msg"
     # 复用已知形态，避免每次 open 都重探失败形态（减少 sqlcipher 错误日志、提速）
     con, _ = _try_open(clear, cand, only_variant=cred.get("variant"))
     return con
+
+
+def open_db(db_path: str, work_dir: str, pid: int | None = None):
+    """对任意 NTQQ 库：找到它自己的密钥并打开，返回连接或 None（供名称映射库用）。"""
+    cred = find_working_key(db_path, work_dir, pid, try_ascii=False)
+    if not cred:
+        return None
+    return open_decrypted(db_path, cred, work_dir, name=os.path.basename(db_path).replace(".db", ""))
 
 
 if __name__ == "__main__":  # 手动自测：python -m qqkey /data/home

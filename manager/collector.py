@@ -19,9 +19,11 @@ from dataclasses import dataclass, field
 
 try:
     from . import qqkey, msgparser
+    from .names import NameResolver
 except ImportError:  # 独立运行
     import qqkey
     import msgparser
+    from names import NameResolver
 
 PLAIN_DIR = os.environ.get("PLAIN_DIR", "/data/plain")
 
@@ -36,8 +38,9 @@ TABLES = {"c2c_msg_table": False, "group_msg_table": True}
 
 @dataclass
 class Message:
-    chat_id: str                 # 会话标识（对端 uid 或群号）
-    chat_name: str               # 会话显示名
+    chat_id: str                 # 会话标识（对端 uid 或群号）——稳定路由键
+    chat_name: str               # 会话显示名（好友昵称/群名，取不到则号码）
+    chat_number: str             # 对端 QQ号 / 群号——发送时按它搜索定位
     is_group: bool
     sender_id: str               # 发送者 uid
     sender_name: str             # 发送者显示名
@@ -56,6 +59,7 @@ class Collector:
         self.db_path = qqkey.qq_db_path(home)
         self.on_message = on_message
         self.cred: dict | None = None
+        self.names = NameResolver(home)
         os.makedirs(PLAIN_DIR, exist_ok=True)
 
     # -------------------------------------------------------------- 密钥
@@ -123,7 +127,10 @@ class Collector:
         if not chat_id:
             return None
         peer_qq = r[C_PEERQQ]
-        chat_name = str(peer_qq) if peer_qq else chat_id
+        # 发送定位用的号码：群=群号(chat_id)，私聊=对端 QQ 号
+        number = str(chat_id if is_group else (peer_qq or chat_id))
+        # 显示名：群名 / 好友昵称；取不到回退号码
+        chat_name = self.names.display(chat_id, is_group, number) or number
         sender_id = str(r[C_SUID] or "")
         if is_group:
             sender_name = (r[C_GNICK] or r[C_CARD] or str(r[C_SQQ] or "") or sender_id)
@@ -131,7 +138,7 @@ class Collector:
             sender_name = chat_name
         is_self = (r[C_DIR] == 2)      # 方向：2=自己发出（启发式，待真实数据校准）
         return Message(
-            chat_id=chat_id, chat_name=chat_name, is_group=is_group,
+            chat_id=chat_id, chat_name=chat_name, chat_number=number, is_group=is_group,
             sender_id=sender_id, sender_name=str(sender_name),
             type=ct0, text=text, time=r[C_TIME] or 0, msg_id=msg_id,
             table=table, is_self=is_self, media=media,
@@ -152,7 +159,8 @@ class Collector:
         for m in rows:
             if kw and kw not in m.chat_name.lower() and kw not in m.chat_id.lower():
                 continue
-            out.append({"chat_id": m.chat_id, "name": m.chat_name, "is_group": m.is_group})
+            out.append({"chat_id": m.chat_id, "name": m.chat_name,
+                        "number": m.chat_number, "is_group": m.is_group})
             if len(out) >= limit:
                 break
         return out
