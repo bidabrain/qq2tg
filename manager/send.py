@@ -110,6 +110,10 @@ def _search(number: str):
     time.sleep(1.6)                 # 等下拉结果稳定
 
 
+def _txtnorm(s: str) -> str:
+    return re.sub(r"\s+", "", s or "")
+
+
 def _open_by_number(number: str) -> bool:
     """搜号码 → OCR 核对第一个结果含该号码 → 点开。核对不过返回 False，绝不乱点。"""
     _search(number)
@@ -120,6 +124,97 @@ def _open_by_number(number: str) -> bool:
     _click(*RESULT_XY)
     time.sleep(0.8)
     return bool(_ocr(TITLE_REGION))  # 标题栏有内容 = 会话已打开
+
+
+DROPDOWN_REGION = (56, 95, 310, 300)   # 搜索下拉结果区（x,y,w,h @1000x720）
+# 分区标题（群聊/联系人/文件/聊天记录/搜索综合结果…）——用它们的结构来定位，而非靠文件扩展名
+_SECTION_PAT = re.compile(r"^\s*(群聊|联系人|文件|聊天记录|搜索综合结果|收藏|频道|网络查找|相关)\s*$")
+def _is_section(text: str) -> str | None:
+    m = _SECTION_PAT.match(text)
+    return text.strip() if m else None
+
+
+def _ocr_lines(region):
+    """OCR 区域，返回按从上到下排序的 [(行文本, 行中心y绝对)]。"""
+    fd, png = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    out = []
+    try:
+        if subprocess.run(["scrot", "-a", ",".join(map(str, region)), "-o", png],
+                          capture_output=True, env=_env()).returncode != 0:
+            return out
+        base = png[:-4]
+        subprocess.run(["tesseract", png, base, "-l", "chi_sim+eng", "tsv"],
+                       capture_output=True, env=_env())
+        tsv = base + ".tsv"
+        if not os.path.exists(tsv):
+            return out
+        lines = {}
+        with open(tsv, encoding="utf-8") as f:
+            next(f, None)
+            for row in f:
+                c = row.rstrip("\n").split("\t")
+                if len(c) < 12 or not c[11].strip():
+                    continue
+                key = tuple(c[1:5])           # page,block,par,line
+                lines.setdefault(key, []).append((int(c[6]), int(c[7]), int(c[8]), int(c[9]), c[11]))
+        os.remove(tsv)
+        for parts in lines.values():
+            text = "".join(p[4] for p in parts)
+            y0 = min(p[1] for p in parts)
+            y1 = max(p[1] + p[3] for p in parts)
+            out.append((text, region[1] + (y0 + y1) // 2))
+        out.sort(key=lambda r: r[1])
+    finally:
+        try:
+            os.remove(png)
+        except OSError:
+            pass
+    return out
+
+
+def _find_group_row(name: str) -> int | None:
+    """定位「群聊」分区下的第一行结果（即群本身），返回其中心 y。
+    用分区结构定位、不靠文件扩展名：找到「群聊」标题 → 取其下、下一个分区标题之前的第一行。
+    OCR 没识别出分区标题时，退回到"名字前缀匹配且不像文件(带大小/发给)"的行。"""
+    g = _txtnorm(name)
+    lines = [(t, cy) for t, cy in _ocr_lines(DROPDOWN_REGION) if cy >= 120]
+    # 主路径：群聊分区下第一行
+    section = None
+    for text, cy in lines:
+        sec = _is_section(text)
+        if sec is not None:
+            section = sec
+            continue
+        if section and "群聊" in section:
+            return cy                        # 群聊分区下的第一行 = 群
+    # 退回：名字前缀命中、且不像文件行（带文件大小/发给字样）
+    filelike = re.compile(r"\d+(\.\d+)?\s*(MB|KB|GB|B)\b|发给|转发", re.I)
+    for text, cy in lines:
+        t = _txtnorm(text)
+        if _is_section(text) or filelike.search(text):
+            continue
+        if t == g or g[:5] in t or t[:5] in g:
+            return cy
+    return None
+
+
+def _open_by_name(name: str) -> bool:
+    """搜群名/昵称 → 在下拉里定位「群聊」那一行点开 → 标题栏 OCR 核对。
+    用于号码搜不到的会话（如设了"禁止群号搜索"的群）。核对不过返回 False，绝不点到文件。"""
+    g = _txtnorm(name)
+    if len(g) < 2:
+        return False
+    _search(name)
+    cy = _find_group_row(name)
+    if cy is None:
+        return False                         # 下拉里没找到匹配的群行 → 不乱点
+    _click(RESULT_XY[0], cy)
+    time.sleep(0.8)
+    title = _txtnorm(_ocr(TITLE_REGION))
+    if not title:
+        return False
+    return title == g or g[:6] in title or title[:6] in g
 
 
 def send_to_open(text: str) -> dict:
@@ -133,24 +228,26 @@ def send_to_open(text: str) -> dict:
     return {"ok": True, "msg": "已发送到当前会话"}
 
 
-def _open_target(number: str) -> dict | None:
-    """规整窗口 + 按号码核对定位会话。成功返回 None，失败返回错误 dict。"""
+def _open_target(number: str, name: str = "") -> dict | None:
+    """规整窗口 + 定位会话：先按号码搜，搜不到再按群名/昵称兜底（如禁群号搜索的群）。
+    成功返回 None，失败返回错误 dict。核对不过绝不发送，避免误发。"""
     win = _qq_win()
     if not win:
         return {"ok": False, "step": "find_window", "msg": "找不到 QQ 窗口（是否已登录）"}
     _normalize(win)
-    if not _open_by_number(number):
-        return {"ok": False, "step": "verify",
-                "msg": f"未能按号码「{number}」定位会话（搜索无匹配，已避免误发）"}
-    return None
+    if _open_by_number(number):
+        return None
+    if name and _open_by_name(name):        # 号码搜不到 → 按名字兜底
+        return None
+    hint = f"号码「{number}」" + (f"/名字「{name}」" if name else "")
+    return {"ok": False, "step": "verify", "msg": f"未能定位会话（{hint} 均搜索无匹配，已避免误发）"}
 
 
-def send_to_chat(chat_name: str, chat_id: str, text: str) -> dict:
-    """chat_name 为 QQ 号/群号（采集层已把会话显示名设为号码）。
-    搜号码并核对后发送；核对不过绝不发送，避免误发。"""
-    number = re.sub(r"\D", "", str(chat_name)) or str(chat_id)
+def send_to_chat(number: str, chat_id: str, text: str, name: str = "") -> dict:
+    """number=QQ号/群号；name=群名/昵称（号码搜不到时兜底）。核对不过绝不发送。"""
+    num = re.sub(r"\D", "", str(number)) or str(chat_id)
     with _LOCK:
-        err = _open_target(number)
+        err = _open_target(num, name)
         if err:
             return err
         return send_to_open(text)
@@ -188,22 +285,22 @@ def _pick_and_send(btn_xy, path: str, finalize: str) -> dict:
     return {"ok": True, "msg": "已发送"}
 
 
-def send_image_to_chat(number: str, chat_id: str, image_path: str) -> dict:
+def send_image_to_chat(number: str, chat_id: str, image_path: str, name: str = "") -> dict:
     """定位会话 → 「发送图片」按钮选图发送（不走剪贴板）。核对不过不发。"""
-    number = re.sub(r"\D", "", str(number)) or str(chat_id)
+    num = re.sub(r"\D", "", str(number)) or str(chat_id)
     with _LOCK:
-        err = _open_target(number)
+        err = _open_target(num, name)
         if err:
             return err
         r = _pick_and_send(IMAGE_BTN_XY, image_path, finalize="enter")
         return {**r, "msg": "已发送图片"} if r.get("ok") else r
 
 
-def send_file_to_chat(number: str, chat_id: str, file_path: str) -> dict:
+def send_file_to_chat(number: str, chat_id: str, file_path: str, name: str = "") -> dict:
     """定位会话 → 「发送文件」选文件发送（.mp4 以视频形式）。核对不过不发。"""
-    number = re.sub(r"\D", "", str(number)) or str(chat_id)
+    num = re.sub(r"\D", "", str(number)) or str(chat_id)
     with _LOCK:
-        err = _open_target(number)
+        err = _open_target(num, name)
         if err:
             return err
         r = _pick_and_send(FILE_BTN_XY, file_path, finalize="dialog")

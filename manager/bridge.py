@@ -171,21 +171,22 @@ class Bridge:
         if not chat_id:
             return
         info = self.map[chat_id]
-        number = info.get("number") or info.get("name")   # 发送按号码定位
-        r = await asyncio.to_thread(send.send_to_chat, number, chat_id, msg.text)
+        number = info.get("number") or info.get("name")   # 先按号码定位
+        name = info.get("name") or ""                      # 号码搜不到时按群名兜底
+        r = await asyncio.to_thread(send.send_to_chat, number, chat_id, msg.text, name)
         if r.get("ok"):
             self._recent_sent.append((chat_id, self._norm(msg.text), time.time()))
         else:
             await msg.reply_text(f"❌ 发送失败：{r.get('msg')}")
 
-    def _target(self, msg) -> tuple[str, str] | None:
-        """从 TG 话题消息解析出 (chat_id, 号码)；非映射话题返回 None。"""
+    def _target(self, msg):
+        """从 TG 话题消息解析出 (chat_id, 号码, 群名)；非映射话题返回 None。"""
         tid = msg.message_thread_id if msg else None
         chat_id = self.rev.get(tid) if tid else None
         if not chat_id:
             return None
         info = self.map[chat_id]
-        return chat_id, (info.get("number") or info.get("name"))
+        return chat_id, (info.get("number") or info.get("name")), (info.get("name") or "")
 
     async def on_tg_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """TG 话题里发来的图片 → 下载 → 按号码定位会话 → 剪贴板粘贴发回 QQ。"""
@@ -195,13 +196,13 @@ class Bridge:
         tgt = self._target(msg)
         if not tgt or not msg.photo:
             return
-        chat_id, number = tgt
+        chat_id, number, name = tgt
         tmp = DATA / "media" / f"tg_{msg.message_id}.jpg"
         tmp.parent.mkdir(parents=True, exist_ok=True)
         try:
             tgf = await msg.photo[-1].get_file()
             await tgf.download_to_drive(str(tmp))
-            r = await asyncio.to_thread(send.send_image_to_chat, number, chat_id, str(tmp))
+            r = await asyncio.to_thread(send.send_image_to_chat, number, chat_id, str(tmp), name)
             if r.get("ok"):
                 self._recent_sent.append((chat_id, "\x00MEDIA", time.time()))
             else:
@@ -230,7 +231,7 @@ class Bridge:
         try:
             tgf = await media_obj.get_file()
             await tgf.download_to_drive(str(tmp))
-            r = await asyncio.to_thread(send.send_file_to_chat, number, chat_id, str(tmp))
+            r = await asyncio.to_thread(send.send_file_to_chat, number, chat_id, str(tmp), name)
             if r.get("ok"):
                 self._recent_sent.append((chat_id, "\x00MEDIA", time.time()))
             else:
