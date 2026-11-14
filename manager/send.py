@@ -28,6 +28,7 @@ RESULT_REGION = (74, 128, 300, 64)   # 第一个结果行区域（OCR 核对号�
 INPUT_XY = (650, 600)         # 聊天输入框空白区
 TITLE_REGION = (322, 54, 240, 30)    # 会话标题栏（确认已打开会话）
 FILE_BTN_XY = (409, 535)      # 底部工具栏「发送文件」(文件夹图标)
+IMAGE_BTN_XY = (441, 535)     # 底部工具栏「发送图片」(图片图标)
 CONFIRM_SEND_XY = (500, 509)  # QQ「发送给 X」确认框里的「发送(1)」按钮(居中)
 _LOCK = threading.Lock()
 
@@ -57,10 +58,16 @@ def _qq_win() -> str | None:
 
 
 def _normalize(win: str):
-    _x("windowactivate", "--sync", win)
+    """把窗口摆到 (0,0) 1000x720。幂等：已就位则不再 resize/activate——
+    Xvfb 下反复 resize/activate CEF 窗口会间歇性黑屏不重绘，故尽量少动。"""
+    g = _x("getwindowgeometry", win).stdout
+    if "Position: 0,0" in g and f"{WIN_W}x{WIN_H}" in g:
+        _x("windowraise", win)     # 已就位，仅抬到最前（不 activate --sync，避免黑屏）
+        time.sleep(0.15)
+        return
     _x("windowmove", win, "0", "0")
     _x("windowsize", win, str(WIN_W), str(WIN_H))
-    time.sleep(0.25)
+    time.sleep(0.5)
 
 
 def _click(x: int, y: int):
@@ -149,27 +156,6 @@ def send_to_chat(chat_name: str, chat_id: str, text: str) -> dict:
         return send_to_open(text)
 
 
-def _clip_image(path: str):
-    subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-i", path], env=_env())
-
-
-def send_image_to_chat(number: str, chat_id: str, image_path: str) -> dict:
-    """定位会话后，把图片经剪贴板粘贴发送。核对不过不发。"""
-    number = re.sub(r"\D", "", str(number)) or str(chat_id)
-    with _LOCK:
-        err = _open_target(number)
-        if err:
-            return err
-        _clip_image(image_path)
-        time.sleep(0.3)
-        _click(*INPUT_XY)
-        time.sleep(0.2)
-        _x("key", "ctrl+v")
-        time.sleep(0.8)
-        _x("key", "Return")
-        return {"ok": True, "msg": "已发送图片"}
-
-
 def _file_dialog() -> bool:
     """等「选择文件/打开」对话框出现，最多 ~3s。"""
     for _ in range(10):
@@ -180,27 +166,48 @@ def _file_dialog() -> bool:
     return False
 
 
-def send_file_to_chat(number: str, chat_id: str, file_path: str) -> dict:
-    """定位会话 → 「发送文件」→ 文件对话框用 Ctrl+L 输入绝对路径 → 发送。
-    QQ 按类型发送（.mp4 以视频形式）。核对不过不发。"""
+def _pick_and_send(btn_xy, path: str, finalize: str) -> dict:
+    """点工具栏按钮(图片/文件)→ 文件选择器用 Ctrl+L 输绝对路径 → 发送。
+    不走剪贴板(剪贴板粘贴图片会让 QQ 在 Xvfb 下黑屏/不稳)。
+    finalize: 'dialog'=文件会弹「发送给X」确认框，点它的发送；'enter'=图片进输入框，回车发。"""
+    _click(*btn_xy)
+    if not _file_dialog():
+        return {"ok": False, "step": "dialog", "msg": "未弹出文件选择对话框"}
+    _x("key", "ctrl+l")              # GTK 文件选择器：打开路径输入栏
+    time.sleep(0.2)
+    _clip(path)                      # 仅复制文本路径（非图片），安全
+    _x("key", "ctrl+v")
+    time.sleep(0.2)
+    _x("key", "Return")              # 选中文件
+    time.sleep(1.2)
+    if finalize == "dialog":
+        _click(*CONFIRM_SEND_XY)     # 文件：点「发送给 X」确认框里的「发送(1)」
+    else:
+        _x("key", "Return")          # 图片：已进输入框，回车发送
+    time.sleep(0.6)
+    return {"ok": True, "msg": "已发送"}
+
+
+def send_image_to_chat(number: str, chat_id: str, image_path: str) -> dict:
+    """定位会话 → 「发送图片」按钮选图发送（不走剪贴板）。核对不过不发。"""
     number = re.sub(r"\D", "", str(number)) or str(chat_id)
     with _LOCK:
         err = _open_target(number)
         if err:
             return err
-        _click(*FILE_BTN_XY)
-        if not _file_dialog():
-            return {"ok": False, "step": "dialog", "msg": "未弹出文件选择对话框"}
-        _x("key", "ctrl+l")          # GTK 文件选择器：打开路径输入栏
-        time.sleep(0.2)
-        _clip(file_path)
-        _x("key", "ctrl+v")
-        time.sleep(0.2)
-        _x("key", "Return")          # 选中文件 → QQ 弹出「发送给 X」确认框
-        time.sleep(1.2)
-        _click(*CONFIRM_SEND_XY)     # 点确认框里的「发送(1)」按钮
-        time.sleep(0.6)
-        return {"ok": True, "msg": "已发送文件"}
+        r = _pick_and_send(IMAGE_BTN_XY, image_path, finalize="enter")
+        return {**r, "msg": "已发送图片"} if r.get("ok") else r
+
+
+def send_file_to_chat(number: str, chat_id: str, file_path: str) -> dict:
+    """定位会话 → 「发送文件」选文件发送（.mp4 以视频形式）。核对不过不发。"""
+    number = re.sub(r"\D", "", str(number)) or str(chat_id)
+    with _LOCK:
+        err = _open_target(number)
+        if err:
+            return err
+        r = _pick_and_send(FILE_BTN_XY, file_path, finalize="dialog")
+        return {**r, "msg": "已发送文件"} if r.get("ok") else r
 
 
 if __name__ == "__main__":  # 自测：python send.py <QQ号/群号> "消息"
