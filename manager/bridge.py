@@ -57,7 +57,9 @@ class Bridge:
     def _is_echo(self, m: "Message") -> bool:
         now = time.time()
         self._recent_sent = [e for e in self._recent_sent if now - e[2] < 120]
-        key = self._norm(m.text)
+        # 媒体消息的正文是占位([图片]/[视频])，无法按文本匹配；统一用 \x00MEDIA 作 key，
+        # 与 on_tg_photo/on_tg_video 记录的一致，从而正确识别桥接自己发的媒体、去回声。
+        key = "\x00MEDIA" if m.media in ("image", "video") else self._norm(m.text)
         for i, (cid, txt, _) in enumerate(self._recent_sent):
             if cid == m.chat_id and txt == key:
                 self._recent_sent.pop(i)
