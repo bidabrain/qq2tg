@@ -11,4 +11,8 @@ eval "$(dbus-launch --sh-syntax)"
 QQ_BIN="$(command -v qq || true)"
 [[ -z "$QQ_BIN" && -x /opt/QQ/qq ]] && QQ_BIN=/opt/QQ/qq
 [[ -z "$QQ_BIN" ]] && { echo "[start-qq] 找不到 qq 可执行文件"; exit 1; }
-exec "$QQ_BIN" --no-sandbox
+# QQ 是 Electron/CEF 应用：Xvfb 无头环境下必须禁用 GPU/硬件合成，否则窗口被
+# 操作(resize/activate)后 CEF 渲染器会黑屏不重绘甚至崩溃。强制软件渲染保证稳定。
+exec "$QQ_BIN" --no-sandbox \
+  --disable-gpu --disable-gpu-compositing --disable-software-rasterizer \
+  --disable-features=UseChromeOSDirectVideoDecoder --in-process-gpu

@@ -126,20 +126,12 @@ def send_to_open(text: str) -> dict:
     return {"ok": True, "msg": "已发送到当前会话"}
 
 
-def _dismiss_modals():
-    """按 Esc 清掉可能残留的弹窗（上一次发送若卡在确认框/文件框，别影响这次）。"""
-    for _ in range(2):
-        _x("key", "Escape")
-        time.sleep(0.15)
-
-
 def _open_target(number: str) -> dict | None:
     """规整窗口 + 按号码核对定位会话。成功返回 None，失败返回错误 dict。"""
     win = _qq_win()
     if not win:
         return {"ok": False, "step": "find_window", "msg": "找不到 QQ 窗口（是否已登录）"}
     _normalize(win)
-    _dismiss_modals()
     if not _open_by_number(number):
         return {"ok": False, "step": "verify",
                 "msg": f"未能按号码「{number}」定位会话（搜索无匹配，已避免误发）"}
