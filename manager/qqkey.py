@@ -175,23 +175,40 @@ def strip_header(src: str, out: str) -> str:
     return out
 
 
-def _try_open(clear_db: str, cand: dict):
-    """尝试用候选打开剥头库，返回 (con, variant) 或 (None, None)。"""
+def _variant_stmt(tag: str, key: str, salt: str | None):
+    """返回某个解密形态的 (key_pragma, extras) 或 None。"""
+    _HMAC_SHA1 = ["PRAGMA cipher_hmac_algorithm = HMAC_SHA1"]
+    table = {
+        "A_raw_key_salt": lambda: ('PRAGMA key = "x\'%s%s\'"' % (key, salt), []),
+        "D_raw_key_salt_sha1": lambda: ('PRAGMA key = "x\'%s%s\'"' % (key, salt), _HMAC_SHA1),
+        "B_raw_key": lambda: ('PRAGMA key = "x\'%s\'"' % key, []),
+        "B_raw_key_sha1": lambda: ('PRAGMA key = "x\'%s\'"' % key, _HMAC_SHA1),
+        "C_passphrase": lambda: ("PRAGMA key = '%s'" % key, _SHA1_PARAMS),
+    }
+    f = table.get(tag)
+    return f() if f else None
+
+
+def _variants_for_kind(kind: str) -> list[str]:
+    if kind == "key+salt":
+        return ["A_raw_key_salt", "D_raw_key_salt_sha1"]
+    if kind == "key_only":
+        return ["B_raw_key", "B_raw_key_sha1"]
+    return ["C_passphrase"]
+
+
+def _try_open(clear_db: str, cand: dict, only_variant: str | None = None):
+    """尝试打开剥头库，返回 (con, variant) 或 (None, None)。
+    only_variant 指定时只试该形态（已知密钥复用，避免每次重探产生失败日志）。"""
     import sqlcipher3.dbapi2 as sqlcipher
     key = cand["key"]
     salt = cand.get("salt")
-    variants: list[tuple[str, str, list[str]]] = []
-    if cand["kind"] == "key+salt":
-        variants.append(("A_raw_key_salt", 'PRAGMA key = "x\'%s%s\'"' % (key, salt), []))
-        variants.append(("D_raw_key_salt_sha1", 'PRAGMA key = "x\'%s%s\'"' % (key, salt),
-                         ["PRAGMA cipher_hmac_algorithm = HMAC_SHA1"]))
-    elif cand["kind"] == "key_only":
-        variants.append(("B_raw_key", 'PRAGMA key = "x\'%s\'"' % key, []))
-        variants.append(("B_raw_key_sha1", 'PRAGMA key = "x\'%s\'"' % key,
-                         ["PRAGMA cipher_hmac_algorithm = HMAC_SHA1"]))
-    else:  # ascii 口令
-        variants.append(("C_passphrase", "PRAGMA key = '%s'" % key, _SHA1_PARAMS))
-    for tag, key_stmt, extras in variants:
+    tags = [only_variant] if only_variant else _variants_for_kind(cand["kind"])
+    for tag in tags:
+        built = _variant_stmt(tag, key, salt)
+        if not built:
+            continue
+        key_stmt, extras = built
         con = sqlcipher.connect(clear_db)
         try:
             cur = con.cursor()
@@ -213,6 +230,24 @@ def _try_open(clear_db: str, cand: dict):
     return None, None
 
 
+def _sync_wal(db_path: str, clear: str):
+    """把源库 WAL 同步到剥头副本旁（SQLCipher 才能读到最新数据）。
+    QQ 会频繁 checkpoint 并删除 WAL，故对 copy 失败容错（文件消失即忽略）。"""
+    wal = db_path + "-wal"
+    try:
+        if os.path.exists(wal):
+            shutil.copy2(wal, clear + "-wal")
+            return
+    except OSError:
+        pass
+    # 无 WAL 或拷贝失败：清掉副本旁可能过期的 WAL，避免读到旧数据
+    try:
+        if os.path.exists(clear + "-wal"):
+            os.remove(clear + "-wal")
+    except OSError:
+        pass
+
+
 def find_working_key(db_path: str, work_dir: str, pid: int | None = None,
                      try_ascii: bool = True) -> dict | None:
     """扫描内存 + 逐候选试开，返回命中的 {key, kind, variant, salt} 或 None。"""
@@ -222,12 +257,7 @@ def find_working_key(db_path: str, work_dir: str, pid: int | None = None,
     salt_hex = read_salt(db_path)
     os.makedirs(work_dir, exist_ok=True)
     clear = strip_header(db_path, os.path.join(work_dir, "nt_msg_clear.db"))
-    # 同步 WAL（有则一起剥头后放到副本旁，SQLCipher 才能读到最新数据）
-    wal = db_path + "-wal"
-    if os.path.exists(wal):
-        shutil.copy2(wal, clear + "-wal")
-    elif os.path.exists(clear + "-wal"):
-        os.remove(clear + "-wal")
+    _sync_wal(db_path, clear)
 
     cands = scan_memory_candidates(pid, salt_hex)
     for c in cands:
@@ -249,13 +279,10 @@ def open_decrypted(db_path: str, cred: dict, work_dir: str, name: str = "nt_msg"
     """按已知密钥打开（剥头 + 同步 WAL + 试开），返回 sqlcipher 连接。失败返回 None。"""
     os.makedirs(work_dir, exist_ok=True)
     clear = strip_header(db_path, os.path.join(work_dir, f"{name}_clear.db"))
-    wal = db_path + "-wal"
-    if os.path.exists(wal):
-        shutil.copy2(wal, clear + "-wal")
-    elif os.path.exists(clear + "-wal"):
-        os.remove(clear + "-wal")
+    _sync_wal(db_path, clear)
     cand = {"kind": cred["kind"], "key": cred["key"], "salt": cred.get("salt")}
-    con, _ = _try_open(clear, cand)
+    # 复用已知形态，避免每次 open 都重探失败形态（减少 sqlcipher 错误日志、提速）
+    con, _ = _try_open(clear, cand, only_variant=cred.get("variant"))
     return con
 
 
