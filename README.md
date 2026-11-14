@@ -48,9 +48,9 @@ docker compose up -d --build
 `docker-compose.yml` 关键项：`cap_add: SYS_PTRACE`、`security_opt: seccomp:unconfined`
 （取密钥 / gdb 需要）、`shm_size: 1g`、`./data:/data`（持久化登录态、数据库、配置、日志）。
 
-> QQ 的 deb 下载链接会随版本更新失效（Dockerfile 默认取自官方下载配置
-> `https://im.qq.com/rainbow/linuxQQDownload`）。若构建时下载报 404，到官网取最新 amd64 deb 直链，
-> 用 `--build-arg QQ_DEB=<直链>` 覆盖。
+> QQ 的 deb 直链在 `qqdl.gtimg.cn`，路径含版本号与哈希段，会随版本更新（官网下载配置里
+> 的 `dldir1v6` 链接对公网并不可下）。最新可用链接可参考 AUR `linuxqq` 包的 PKGBUILD。
+> 若构建时下载报 404，用 `--build-arg QQ_DEB=<最新 amd64 deb 直链>` 覆盖。
 
 ## Telegram 配置
 

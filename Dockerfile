@@ -11,9 +11,10 @@
 
 FROM ubuntu:24.04
 
-# QQ 官方 Linux 版 amd64 deb（取自官方下载配置 https://im.qq.com/rainbow/linuxQQDownload）。
-# 版本会更新、旧链接会失效；若构建时下载 404，到官网取最新 amd64 deb 链接用 --build-arg QQ_DEB=... 覆盖。
-ARG QQ_DEB="https://dldir1v6.qq.com/qqfile/qq/QQNT/Linux/QQ_3.2.18_250626_amd64_01.deb"
+# QQ 官方 Linux 版 amd64 deb。真正可下载的直链在 qqdl.gtimg.cn，路径含版本号与哈希段，
+# 随版本更新（可参考 AUR linuxqq 包的 PKGBUILD 取最新链接）。
+# 若构建时下载 404，用 --build-arg QQ_DEB=<最新 amd64 deb 直链> 覆盖。
+ARG QQ_DEB="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.37/beta/816b3c79/linuxqq_3.2.35-54395_amd64.deb"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=zh_CN.UTF-8 \
