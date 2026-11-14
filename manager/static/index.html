@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>qq2tg</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <b>qq2tg</b>
+    <nav class="tabs" id="tabs">
+      <button data-tab="overview" class="active">概览</button>
+      <button data-tab="screen">QQ 画面</button>
+      <button data-tab="telegram">Telegram</button>
+      <button data-tab="messages">最近消息</button>
+      <button data-tab="logs">日志</button>
+    </nav>
+    <span style="flex:1"></span>
+    <button class="btn" id="logout">退出</button>
+  </header>
+
+  <main>
+    <!-- 概览 -->
+    <section data-pane="overview" class="pane">
+      <div class="grid">
+        <div class="card">
+          <h3>QQ</h3>
+          <div class="kv"><span>进程</span><b id="qq-running">—</b></div>
+          <div class="kv"><span>登录+取密钥</span><b id="qq-login">—</b></div>
+          <p class="muted" id="qq-hint"></p>
+          <button class="btn" id="btn-restart-qq">重启 QQ</button>
+        </div>
+        <div class="card">
+          <h3>转发服务</h3>
+          <div class="kv"><span>桥接(bridge)</span><b id="svc-bridge">—</b></div>
+          <div class="kv"><span>Telegram</span><b id="tg-configured">—</b></div>
+          <div class="kv"><span>QQ→TG</span><b id="tg-forward">—</b></div>
+          <div class="kv"><span>TG→QQ</span><b id="tg-reply">—</b></div>
+          <button class="btn" id="btn-restart-bridge">重启桥接</button>
+        </div>
+        <div class="card">
+          <h3>显示栈</h3>
+          <div class="kv"><span>Xvfb</span><b id="svc-xvfb">—</b></div>
+          <div class="kv"><span>x11vnc</span><b id="svc-x11vnc">—</b></div>
+          <div class="kv"><span>openbox</span><b id="svc-openbox">—</b></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- QQ 画面 -->
+    <section data-pane="screen" class="pane" hidden>
+      <p class="muted">未登录时这里会显示 QQ 登录界面，用手机 QQ 扫码登录。掉线后重新扫码即可。</p>
+      <iframe id="vnc" class="vnc" src="about:blank"></iframe>
+    </section>
+
+    <!-- Telegram -->
+    <section data-pane="telegram" class="pane" hidden>
+      <div class="card" style="max-width:560px">
+        <h3>Telegram 配置</h3>
+        <label>Bot Token
+          <input id="cfg-token" type="password" placeholder="留空表示不修改已保存的 token">
+          <span class="muted" id="cfg-token-mask"></span>
+        </label>
+        <label>Chat ID
+          <input id="cfg-chat" type="text" placeholder="你的 user id 或群 -100... id">
+        </label>
+        <label class="ck"><input type="checkbox" id="cfg-forward"> QQ → Telegram 转发</label>
+        <label class="ck"><input type="checkbox" id="cfg-reply"> Telegram → QQ 回发（实验性，需校准坐标）</label>
+        <div class="row" style="margin-top:12px">
+          <button class="btn primary" id="btn-save-cfg">保存并重启桥接</button>
+          <span id="cfg-msg" class="muted"></span>
+        </div>
+        <p class="muted" style="margin-top:14px">
+          不知道怎么拿 token / chat id？搜 <code>@BotFather</code> 建 bot 拿 token；
+          搜 <code>@userinfobot</code> 拿你的 user id；群 id 把 bot 拉进群后看
+          <code>getUpdates</code>。目标群需开启 Topics（论坛模式），bot 设为管理员并给「管理话题」权限。
+        </p>
+      </div>
+    </section>
+
+    <!-- 最近消息 -->
+    <section data-pane="messages" class="pane" hidden>
+      <div class="row"><button class="btn" id="btn-refresh-msg">刷新</button><span class="muted" id="msg-hint"></span></div>
+      <table class="tbl" id="msg-tbl"><thead><tr><th>时间</th><th>会话</th><th>发送者</th><th>内容</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <!-- 日志 -->
+    <section data-pane="logs" class="pane" hidden>
+      <div class="row">
+        <select id="log-name">
+          <option value="bridge">bridge</option>
+          <option value="qq">qq</option>
+          <option value="manager">manager</option>
+          <option value="display">display</option>
+          <option value="supervisord">supervisord</option>
+        </select>
+        <button class="btn" id="btn-refresh-log">刷新</button>
+        <label class="ck"><input type="checkbox" id="log-auto"> 自动刷新</label>
+      </div>
+      <pre id="log-out" class="log"></pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

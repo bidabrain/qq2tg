@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+PyYAML==6.0.2
+# QQ NTQQ 数据库解密（SQLCipher，bundled 构建，支持 HMAC_SHA1 / PBKDF2_HMAC_SHA512）
+sqlcipher3-binary==0.5.4
+# Telegram 转发
+python-telegram-bot==21.9
