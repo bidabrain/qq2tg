@@ -126,95 +126,24 @@ def _open_by_number(number: str) -> bool:
     return bool(_ocr(TITLE_REGION))  # 标题栏有内容 = 会话已打开
 
 
-DROPDOWN_REGION = (56, 95, 310, 300)   # 搜索下拉结果区（x,y,w,h @1000x720）
-# 分区标题（群聊/联系人/文件/聊天记录/搜索综合结果…）——用它们的结构来定位，而非靠文件扩展名
-_SECTION_PAT = re.compile(r"^\s*(群聊|联系人|文件|聊天记录|搜索综合结果|收藏|频道|网络查找|相关)\s*$")
-def _is_section(text: str) -> str | None:
-    m = _SECTION_PAT.match(text)
-    return text.strip() if m else None
-
-
-def _ocr_lines(region):
-    """OCR 区域，返回按从上到下排序的 [(行文本, 行中心y绝对)]。"""
-    fd, png = tempfile.mkstemp(suffix=".png")
-    os.close(fd)
-    out = []
-    try:
-        if subprocess.run(["scrot", "-a", ",".join(map(str, region)), "-o", png],
-                          capture_output=True, env=_env()).returncode != 0:
-            return out
-        base = png[:-4]
-        subprocess.run(["tesseract", png, base, "-l", "chi_sim+eng", "tsv"],
-                       capture_output=True, env=_env())
-        tsv = base + ".tsv"
-        if not os.path.exists(tsv):
-            return out
-        lines = {}
-        with open(tsv, encoding="utf-8") as f:
-            next(f, None)
-            for row in f:
-                c = row.rstrip("\n").split("\t")
-                if len(c) < 12 or not c[11].strip():
-                    continue
-                key = tuple(c[1:5])           # page,block,par,line
-                lines.setdefault(key, []).append((int(c[6]), int(c[7]), int(c[8]), int(c[9]), c[11]))
-        os.remove(tsv)
-        for parts in lines.values():
-            text = "".join(p[4] for p in parts)
-            y0 = min(p[1] for p in parts)
-            y1 = max(p[1] + p[3] for p in parts)
-            out.append((text, region[1] + (y0 + y1) // 2))
-        out.sort(key=lambda r: r[1])
-    finally:
-        try:
-            os.remove(png)
-        except OSError:
-            pass
-    return out
-
-
-def _find_group_row(name: str) -> int | None:
-    """定位「群聊」分区下的第一行结果（即群本身），返回其中心 y。
-    用分区结构定位、不靠文件扩展名：找到「群聊」标题 → 取其下、下一个分区标题之前的第一行。
-    OCR 没识别出分区标题时，退回到"名字前缀匹配且不像文件(带大小/发给)"的行。"""
-    g = _txtnorm(name)
-    lines = [(t, cy) for t, cy in _ocr_lines(DROPDOWN_REGION) if cy >= 120]
-    # 主路径：群聊分区下第一行
-    section = None
-    for text, cy in lines:
-        sec = _is_section(text)
-        if sec is not None:
-            section = sec
-            continue
-        if section and "群聊" in section:
-            return cy                        # 群聊分区下的第一行 = 群
-    # 退回：名字前缀命中、且不像文件行（带文件大小/发给字样）
-    filelike = re.compile(r"\d+(\.\d+)?\s*(MB|KB|GB|B)\b|发给|转发", re.I)
-    for text, cy in lines:
-        t = _txtnorm(text)
-        if _is_section(text) or filelike.search(text):
-            continue
-        if t == g or g[:5] in t or t[:5] in g:
-            return cy
-    return None
+DROPDOWN_REGION = (56, 95, 310, 300)   # 搜索下拉结果区（x,y,w,h @1000x720），用于确认下拉是否关闭
 
 
 def _open_by_name(name: str) -> bool:
-    """搜群名/昵称 → 在下拉里定位「群聊」那一行点开 → 标题栏 OCR 核对。
-    用于号码搜不到的会话（如设了"禁止群号搜索"的群）。核对不过返回 False，绝不点到文件。"""
+    """搜群名/昵称 → 点下拉第一条结果 → 确认会话已打开。
+    用于号码搜不到的会话（如设了"禁止群号搜索"的群/好友）。
+    「联系人」「群聊」分区永远排在「文件/聊天记录/搜索综合结果」之前，所以**下拉第一条
+    结果必定是联系人或群聊**（不会是文件/聊天记录）——直接点第一条即满足"只点联系人/群聊"。"""
     g = _txtnorm(name)
     if len(g) < 2:
         return False
     _search(name)
-    cy = _find_group_row(name)
-    if cy is None:
-        return False                         # 下拉里没找到匹配的群行 → 不乱点
-    _click(RESULT_XY[0], cy)
-    time.sleep(0.8)
-    title = _txtnorm(_ocr(TITLE_REGION))
-    if not title:
-        return False
-    return title == g or g[:6] in title or title[:6] in g
+    _click(*RESULT_XY)                       # 第一条结果 = 联系人/群聊（排在文件/记录之前）
+    time.sleep(1.2)                          # 等下拉关闭 + 会话渲染
+    drop = _ocr(DROPDOWN_REGION)
+    if "综合" in drop or "联系人" in drop or "群聊" in drop:
+        return False                         # 下拉还在 = 没点中结果（名字无匹配会话）
+    return bool(_txtnorm(_ocr(TITLE_REGION)))  # 标题栏非空 = 会话已打开
 
 
 def send_to_open(text: str) -> dict:
