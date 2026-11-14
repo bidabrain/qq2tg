@@ -51,6 +51,7 @@ class Message:
     table: str
     is_self: bool = False        # 是否自己发出（用于避免回声）
     media: str | None = None     # 'image' / 'video' / None
+    media_md5: str = ""          # 媒体 md5（在 nt_data 本地文件按它定位）
 
 
 class Collector:
@@ -120,9 +121,13 @@ class Collector:
         blob = r[C_BODY]
         text, ct0 = ("", 0)
         media = None
+        media_md5 = ""
         if isinstance(blob, (bytes, bytearray)) and blob:
             text, ct0 = msgparser.render_body(bytes(blob))
-            media = msgparser.media_kind(bytes(blob))
+            mi = msgparser.first_media(bytes(blob))
+            if mi:
+                media = mi["kind"]
+                media_md5 = mi.get("md5") or ""
         chat_id = str(r[C_PEERUID] or r[C_PEERQQ] or "")
         if not chat_id:
             return None
@@ -141,7 +146,7 @@ class Collector:
             chat_id=chat_id, chat_name=chat_name, chat_number=number, is_group=is_group,
             sender_id=sender_id, sender_name=str(sender_name),
             type=ct0, text=text, time=r[C_TIME] or 0, msg_id=msg_id,
-            table=table, is_self=is_self, media=media,
+            table=table, is_self=is_self, media=media, media_md5=media_md5,
         )
 
     # -------------------------------------------------------------- 会话列表

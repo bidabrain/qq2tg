@@ -177,13 +177,22 @@ def render_body(blob) -> tuple[str, int]:
 
 def media_kind(blob) -> str | None:
     """判断消息主媒体类型：'image' / 'video' / None。供桥接抓取用。"""
+    info = first_media(blob)
+    return info["kind"] if info else None
+
+
+def first_media(blob) -> dict | None:
+    """返回首个图片/视频段的 {kind,md5,filename,width,height}；无则 None。
+    供桥接按 md5 在 nt_data 本地文件里定位并发给 TG。"""
     for c in parse_40800(blob):
         ct = c["content_type"]
-        if ct == 2:
-            if (c["img_width"] or 0) > 0 or (c["img_height"] or 0) > 0:
-                return "image"
-            if (c["f45415"] or 0) > 0 or (c["video_flag"] or 0) > 0:
-                return "video"
-        if ct == 9 or (ct == 2 and (c["video_flag"] or 0) > 0):
-            return "video"
+        is_video = ct == 9 or (c["video_flag"] or 0) > 0 or (c["f45415"] or 0) > 0
+        is_image = ct == 2 and ((c["img_width"] or 0) > 0 or (c["img_height"] or 0) > 0) \
+            and not c["sticker_hex"]
+        if is_video:
+            return {"kind": "video", "md5": c["md5_hex"], "filename": c["filename"],
+                    "width": c["img_width"], "height": c["img_height"]}
+        if is_image:
+            return {"kind": "image", "md5": c["md5_hex"], "filename": c["filename"],
+                    "width": c["img_width"], "height": c["img_height"]}
     return None

@@ -27,6 +27,8 @@ RESULT_XY = (200, 157)        # 搜索下拉第一个结果行
 RESULT_REGION = (74, 128, 300, 64)   # 第一个结果行区域（OCR 核对号码用）：x,y,w,h
 INPUT_XY = (650, 600)         # 聊天输入框空白区
 TITLE_REGION = (322, 54, 240, 30)    # 会话标题栏（确认已打开会话）
+FILE_BTN_XY = (409, 535)      # 底部工具栏「发送文件」(文件夹图标)
+SEND_BTN_XY = (936, 688)      # 右下「发送」按钮
 _LOCK = threading.Lock()
 
 
@@ -124,19 +126,81 @@ def send_to_open(text: str) -> dict:
     return {"ok": True, "msg": "已发送到当前会话"}
 
 
+def _open_target(number: str) -> dict | None:
+    """规整窗口 + 按号码核对定位会话。成功返回 None，失败返回错误 dict。"""
+    win = _qq_win()
+    if not win:
+        return {"ok": False, "step": "find_window", "msg": "找不到 QQ 窗口（是否已登录）"}
+    _normalize(win)
+    if not _open_by_number(number):
+        return {"ok": False, "step": "verify",
+                "msg": f"未能按号码「{number}」定位会话（搜索无匹配，已避免误发）"}
+    return None
+
+
 def send_to_chat(chat_name: str, chat_id: str, text: str) -> dict:
     """chat_name 为 QQ 号/群号（采集层已把会话显示名设为号码）。
     搜号码并核对后发送；核对不过绝不发送，避免误发。"""
     number = re.sub(r"\D", "", str(chat_name)) or str(chat_id)
     with _LOCK:
-        win = _qq_win()
-        if not win:
-            return {"ok": False, "step": "find_window", "msg": "找不到 QQ 窗口（是否已登录）"}
-        _normalize(win)
-        if not _open_by_number(number):
-            return {"ok": False, "step": "verify",
-                    "msg": f"未能按号码「{number}」定位会话（搜索无匹配，已避免误发）"}
+        err = _open_target(number)
+        if err:
+            return err
         return send_to_open(text)
+
+
+def _clip_image(path: str):
+    subprocess.run(["xclip", "-selection", "clipboard", "-t", "image/png", "-i", path], env=_env())
+
+
+def send_image_to_chat(number: str, chat_id: str, image_path: str) -> dict:
+    """定位会话后，把图片经剪贴板粘贴发送。核对不过不发。"""
+    number = re.sub(r"\D", "", str(number)) or str(chat_id)
+    with _LOCK:
+        err = _open_target(number)
+        if err:
+            return err
+        _clip_image(image_path)
+        time.sleep(0.3)
+        _click(*INPUT_XY)
+        time.sleep(0.2)
+        _x("key", "ctrl+v")
+        time.sleep(0.8)
+        _x("key", "Return")
+        return {"ok": True, "msg": "已发送图片"}
+
+
+def _file_dialog() -> bool:
+    """等「选择文件/打开」对话框出现，最多 ~3s。"""
+    for _ in range(10):
+        if _x("search", "--name", "选择文件").stdout.strip() or \
+           _x("search", "--name", "打开").stdout.strip():
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def send_file_to_chat(number: str, chat_id: str, file_path: str) -> dict:
+    """定位会话 → 「发送文件」→ 文件对话框用 Ctrl+L 输入绝对路径 → 发送。
+    QQ 按类型发送（.mp4 以视频形式）。核对不过不发。"""
+    number = re.sub(r"\D", "", str(number)) or str(chat_id)
+    with _LOCK:
+        err = _open_target(number)
+        if err:
+            return err
+        _click(*FILE_BTN_XY)
+        if not _file_dialog():
+            return {"ok": False, "step": "dialog", "msg": "未弹出文件选择对话框"}
+        _x("key", "ctrl+l")          # GTK 文件选择器：打开路径输入栏
+        time.sleep(0.2)
+        _clip(file_path)
+        _x("key", "ctrl+v")
+        time.sleep(0.2)
+        _x("key", "Return")          # 选中文件（附加到输入框）
+        time.sleep(1.0)
+        _click(*SEND_BTN_XY)         # 发送
+        time.sleep(0.5)
+        return {"ok": True, "msg": "已发送文件"}
 
 
 if __name__ == "__main__":  # 自测：python send.py <QQ号/群号> "消息"

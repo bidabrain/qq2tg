@@ -18,12 +18,13 @@ import threading
 import time
 
 try:
-    from . import config, send
+    from . import config, send, mediafiles
     from .collector import Collector, Message
     from .common import DATA, STATE, save_state
 except ImportError:  # 独立运行
     import config
     import send
+    import mediafiles
     from collector import Collector, Message
     from common import DATA, STATE, save_state
 
@@ -116,9 +117,33 @@ class Bridge:
             return
         asyncio.run_coroutine_threadsafe(self._send_tg(m), self.loop)
 
+    def _caption(self, m: Message) -> str | None:
+        if m.is_group and m.sender_name:
+            return f"{m.sender_name}"
+        if m.is_self:
+            return "🟢 我"
+        return None
+
     async def _send_tg(self, m: Message):
         try:
             tid = await self._topic_for(m.chat_id, m.chat_name, m.chat_number)
+            # 图片/视频：按 md5 在本地 nt_data 找明文文件，发真实媒体；找不到回退占位文本
+            if m.media in ("image", "video") and m.media_md5 and self.cfg.get("media_enabled", True):
+                path, kind = await asyncio.to_thread(
+                    mediafiles.find_media, self.home, m.media, m.media_md5)
+                if path:
+                    cap = self._caption(m)
+                    try:
+                        with open(path, "rb") as f:
+                            if kind == "video":
+                                await self.app.bot.send_video(self.chat_id, f, message_thread_id=tid, caption=cap)
+                            else:
+                                await self.app.bot.send_photo(self.chat_id, f, message_thread_id=tid, caption=cap)
+                        STATE["metrics"]["messages_forwarded"] = STATE["metrics"].get("messages_forwarded", 0) + 1
+                        save_state()
+                        return
+                    except Exception as e:  # noqa: BLE001
+                        print("发送媒体到 TG 失败，回退文本:", e, flush=True)
             text = m.text or ""
             if m.is_group and m.sender_name:
                 text = f"{m.sender_name}:\n{text}"
@@ -150,6 +175,71 @@ class Bridge:
             self._recent_sent.append((chat_id, self._norm(msg.text), time.time()))
         else:
             await msg.reply_text(f"❌ 发送失败：{r.get('msg')}")
+
+    def _target(self, msg) -> tuple[str, str] | None:
+        """从 TG 话题消息解析出 (chat_id, 号码)；非映射话题返回 None。"""
+        tid = msg.message_thread_id if msg else None
+        chat_id = self.rev.get(tid) if tid else None
+        if not chat_id:
+            return None
+        info = self.map[chat_id]
+        return chat_id, (info.get("number") or info.get("name"))
+
+    async def on_tg_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """TG 话题里发来的图片 → 下载 → 按号码定位会话 → 剪贴板粘贴发回 QQ。"""
+        if not self.cfg.get("reply_enabled", False):
+            return
+        msg = update.effective_message
+        tgt = self._target(msg)
+        if not tgt or not msg.photo:
+            return
+        chat_id, number = tgt
+        tmp = DATA / "media" / f"tg_{msg.message_id}.jpg"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tgf = await msg.photo[-1].get_file()
+            await tgf.download_to_drive(str(tmp))
+            r = await asyncio.to_thread(send.send_image_to_chat, number, chat_id, str(tmp))
+            if r.get("ok"):
+                self._recent_sent.append((chat_id, "\x00MEDIA", time.time()))
+            else:
+                await msg.reply_text(f"❌ 图片发送失败：{r.get('msg')}")
+        except Exception as e:  # noqa: BLE001
+            await msg.reply_text(f"❌ 图片发送异常：{e}")
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    async def on_tg_video(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """TG 话题里发来的视频/文件 → 下载 → 按号码定位会话 → 用「发送文件」发回 QQ。"""
+        if not self.cfg.get("reply_enabled", False):
+            return
+        msg = update.effective_message
+        tgt = self._target(msg)
+        media_obj = (msg.video or msg.animation or msg.document) if msg else None
+        if not tgt or not media_obj:
+            return
+        chat_id, number = tgt
+        ext = "mp4" if (msg.video or msg.animation) else "bin"
+        tmp = DATA / "media" / f"tg_{msg.message_id}.{ext}"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tgf = await media_obj.get_file()
+            await tgf.download_to_drive(str(tmp))
+            r = await asyncio.to_thread(send.send_file_to_chat, number, chat_id, str(tmp))
+            if r.get("ok"):
+                self._recent_sent.append((chat_id, "\x00MEDIA", time.time()))
+            else:
+                await msg.reply_text(f"❌ 视频/文件发送失败：{r.get('msg')}")
+        except Exception as e:  # noqa: BLE001
+            await msg.reply_text(f"❌ 视频/文件发送异常：{e}")
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # -------------------------------------------------- 命令
     async def cmd_contacts(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -208,6 +298,11 @@ class Bridge:
         self.app.add_handler(CommandHandler("synctopic", self.cmd_synctopic, filters.Chat(self.chat_id)))
         self.app.add_handler(MessageHandler(
             filters.Chat(self.chat_id) & filters.TEXT & ~filters.COMMAND, self.on_tg_message))
+        self.app.add_handler(MessageHandler(
+            filters.Chat(self.chat_id) & filters.PHOTO, self.on_tg_photo))
+        self.app.add_handler(MessageHandler(
+            filters.Chat(self.chat_id) & (filters.VIDEO | filters.ANIMATION | filters.Document.ALL),
+            self.on_tg_video))
         self.loop = asyncio.get_running_loop()
         threading.Thread(target=self._collector_loop, daemon=True).start()
         print(f"[bridge] 已启动，目标群 chat_id={self.chat_id}，已载入 {len(self.map)} 个 topic 映射", flush=True)
