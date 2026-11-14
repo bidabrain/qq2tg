@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libnss3 libgbm1 libasound2t64 libgtk-3-0t64 libpulse0 libsecret-1-0 \
       libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
       libxcb-render-util0 libxcb-randr0 libxcb-shape0 libxcb-xfixes0 libxcb-xkb1 \
-      libxcb-cursor0 libxcb-sync1 libxss1 libxtst6 libgconf-2-4 \
+      libxcb-cursor0 libxcb-sync1 libxss1 libxtst6 \
   && sed -i 's/# zh_CN.UTF-8/zh_CN.UTF-8/' /etc/locale.gen && locale-gen \
   && curl -fL -o /tmp/qq.deb "${QQ_DEB}" \
   && (apt-get install -y /tmp/qq.deb || (dpkg -i /tmp/qq.deb; apt-get install -y -f)) \
