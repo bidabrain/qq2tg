@@ -110,7 +110,9 @@ class Bridge:
     def _on_qq(self, m: Message):
         if not self.cfg.get("forward_enabled", True) or not self.loop or not self.app:
             return
-        if m.is_self and self._is_echo(m):
+        # 去回声：桥接刚发到 QQ 的消息会被采集回来，匹配到就跳过（不依赖方向判断，更稳）。
+        # 自己从手机/其它 QQ 客户端发的消息不在此列，照常转发（带「🟢 我」前缀）。
+        if self._is_echo(m):
             return
         asyncio.run_coroutine_threadsafe(self._send_tg(m), self.loop)
 
@@ -160,28 +162,44 @@ class Bridge:
         await update.effective_message.reply_text("最近会话：\n" + "\n".join(lines[:40]))
 
     async def cmd_synctopic(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        """手动重同步昵称/群名 → 刷新映射并把已建 topic 改名（昵称/群名会变）。"""
+        """手动重同步昵称/群名 → 刷新映射并把已建 topic 改名（昵称/群名会变）。
+        逐个限速改名并处理 Telegram 限流(flood control)，避免改名失败。"""
+        from telegram.error import RetryAfter
         m = update.effective_message
-        await m.reply_text("🔄 正在重新同步昵称/群名…")
+        await m.reply_text("🔄 正在重新同步昵称/群名（逐个限速改名以避开 Telegram 限流，稍候）…")
         ok = await asyncio.to_thread(self.col.names.refresh)
         if not ok:
             await m.reply_text("❌ 同步失败：未能解密 group_info/profile_info（QQ 是否已登录？）")
             return
-        renamed = 0
+        # 先算出真正需要改名的列表（名字有变化的才改）
+        todo = []
         for chat_id, info in list(self.map.items()):
             is_group = not str(chat_id).startswith("u_")
             number = info.get("number") or info.get("name")
             new_name = self.col.names.display(chat_id, is_group, number) or number
             if new_name and new_name != info.get("name"):
+                todo.append((info, new_name))
+        renamed, failed = 0, 0
+        for info, new_name in todo:
+            for _ in range(4):
                 try:
                     await self.app.bot.edit_forum_topic(
                         self.chat_id, info["topic_id"], name=new_name[:120])
                     info["name"] = new_name
                     renamed += 1
+                    break
+                except RetryAfter as e:           # 命中限流：按要求等足再重试
+                    await asyncio.sleep(getattr(e, "retry_after", 5) + 1)
                 except Exception as e:  # noqa: BLE001
                     print("[bridge] 改 topic 名失败:", e, flush=True)
+                    failed += 1
+                    break
+            await asyncio.sleep(1.5)               # 限速，避免触发 flood control
         self._save_topics()
-        await m.reply_text(f"✅ 同步完成，更新了 {renamed} 个话题名称。")
+        msg = f"✅ 同步完成，更新了 {renamed} 个话题名称"
+        if failed:
+            msg += f"；{failed} 个失败，可稍后再 /synctopic 重试"
+        await m.reply_text(msg)
 
     # -------------------------------------------------- 运行
     async def run(self):

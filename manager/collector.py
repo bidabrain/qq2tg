@@ -136,7 +136,7 @@ class Collector:
             sender_name = (r[C_GNICK] or r[C_CARD] or str(r[C_SQQ] or "") or sender_id)
         else:
             sender_name = chat_name
-        is_self = (r[C_DIR] == 2)      # 方向：2=自己发出（启发式，待真实数据校准）
+        is_self = (r[C_DIR] == 1)      # 方向：1=自己发出，0=收到（实测校准）
         return Message(
             chat_id=chat_id, chat_name=chat_name, chat_number=number, is_group=is_group,
             sender_id=sender_id, sender_name=str(sender_name),
