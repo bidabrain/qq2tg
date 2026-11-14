@@ -28,7 +28,7 @@ RESULT_REGION = (74, 128, 300, 64)   # 第一个结果行区域（OCR 核对号�
 INPUT_XY = (650, 600)         # 聊天输入框空白区
 TITLE_REGION = (322, 54, 240, 30)    # 会话标题栏（确认已打开会话）
 FILE_BTN_XY = (409, 535)      # 底部工具栏「发送文件」(文件夹图标)
-SEND_BTN_XY = (936, 688)      # 右下「发送」按钮
+CONFIRM_SEND_XY = (500, 509)  # QQ「发送给 X」确认框里的「发送(1)」按钮(居中)
 _LOCK = threading.Lock()
 
 
@@ -126,12 +126,20 @@ def send_to_open(text: str) -> dict:
     return {"ok": True, "msg": "已发送到当前会话"}
 
 
+def _dismiss_modals():
+    """按 Esc 清掉可能残留的弹窗（上一次发送若卡在确认框/文件框，别影响这次）。"""
+    for _ in range(2):
+        _x("key", "Escape")
+        time.sleep(0.15)
+
+
 def _open_target(number: str) -> dict | None:
     """规整窗口 + 按号码核对定位会话。成功返回 None，失败返回错误 dict。"""
     win = _qq_win()
     if not win:
         return {"ok": False, "step": "find_window", "msg": "找不到 QQ 窗口（是否已登录）"}
     _normalize(win)
+    _dismiss_modals()
     if not _open_by_number(number):
         return {"ok": False, "step": "verify",
                 "msg": f"未能按号码「{number}」定位会话（搜索无匹配，已避免误发）"}
@@ -196,10 +204,10 @@ def send_file_to_chat(number: str, chat_id: str, file_path: str) -> dict:
         _clip(file_path)
         _x("key", "ctrl+v")
         time.sleep(0.2)
-        _x("key", "Return")          # 选中文件（附加到输入框）
-        time.sleep(1.0)
-        _click(*SEND_BTN_XY)         # 发送
-        time.sleep(0.5)
+        _x("key", "Return")          # 选中文件 → QQ 弹出「发送给 X」确认框
+        time.sleep(1.2)
+        _click(*CONFIRM_SEND_XY)     # 点确认框里的「发送(1)」按钮
+        time.sleep(0.6)
         return {"ok": True, "msg": "已发送文件"}
 
 
