@@ -196,19 +196,45 @@ class Bridge:
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)
-        try:
-            await self.app.bot.set_my_commands([
-                BotCommand("contacts", "最近会话（可带关键词）"),
-                BotCommand("synctopic", "重新同步昵称/群名到话题标题"),
-            ])
-        except Exception as e:  # noqa: BLE001
-            print("设置命令菜单失败:", e, flush=True)
+        await self._reset_commands()
         try:
             await self.app.bot.send_message(self.chat_id, "✅ qq2tg 桥接已连接（Topic 模式）。")
         except Exception as e:  # noqa: BLE001
             print("连接测试消息发送失败（检查 chat_id / bot 是否在群里）:", e, flush=True)
         while True:
             await asyncio.sleep(3600)
+
+    async def _reset_commands(self):
+        """清掉旧程序残留在各作用域的命令，再把本 bot 命令设到默认作用域。
+        Telegram 的 bot 命令按 scope 存，只设默认作用域不会清掉旧程序设在
+        私聊/群/群管理员/指定群等作用域里的命令，故逐个作用域先删。"""
+        from telegram import (
+            BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
+            BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators,
+            BotCommandScopeChat, BotCommandScopeChatAdministrators,
+        )
+        scopes = [
+            BotCommandScopeDefault(), BotCommandScopeAllPrivateChats(),
+            BotCommandScopeAllGroupChats(), BotCommandScopeAllChatAdministrators(),
+        ]
+        if self.chat_id:
+            scopes += [BotCommandScopeChat(chat_id=self.chat_id),
+                       BotCommandScopeChatAdministrators(chat_id=self.chat_id)]
+        # 各语言菜单也可能有残留：清默认语言 + 常见 language_code
+        for sc in scopes:
+            for lang in (None, "", "zh", "zh-hans", "en"):
+                try:
+                    await self.app.bot.delete_my_commands(scope=sc, language_code=lang)
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            await self.app.bot.set_my_commands([
+                BotCommand("contacts", "最近会话（可带关键词）"),
+                BotCommand("synctopic", "重新同步昵称/群名到话题标题"),
+            ], scope=BotCommandScopeDefault())
+            print("[bridge] 已清理旧命令并设置菜单", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print("设置命令菜单失败:", e, flush=True)
 
     def _collector_loop(self):
         while True:
