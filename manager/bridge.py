@@ -152,38 +152,63 @@ class Bridge:
             return "🟢 我"
         return None
 
+    @staticmethod
+    def _is_thread_gone(e) -> bool:
+        """话题在 TG 那边被删/失效（旧 topic_id 已不可用）。"""
+        s = str(e).lower()
+        return ("thread not found" in s or "topic_id_invalid" in s
+                or "topic_id invalid" in s or "thread_not_found" in s)
+
+    def _drop_topic(self, chat_id: str):
+        """丢弃失效的话题映射，下次会自动重建新话题。"""
+        info = self.map.pop(chat_id, None)
+        if info:
+            self.rev.pop(info.get("topic_id"), None)
+            self._save_topics()
+            print(f"[bridge] 话题已失效，丢弃旧映射并将重建：{chat_id} {info.get('name')}", flush=True)
+
+    async def _deliver(self, m: Message):
+        """真正发送（话题不存在则 _topic_for 自动建）。失败抛出，交由 _send_tg 处理。"""
+        tid = await self._topic_for(m.chat_id, m.chat_name, m.chat_number)
+        # 图片/视频：按 md5 在本地 nt_data 找明文文件，发真实媒体；找不到回退占位文本
+        if m.media in ("image", "video") and m.media_md5 and self.cfg.get("media_enabled", True):
+            path, kind = await asyncio.to_thread(
+                mediafiles.find_media, self.home, m.media, m.media_md5)
+            if path:
+                cap = self._caption(m)
+                with open(path, "rb") as f:
+                    if kind == "video":
+                        await self.app.bot.send_video(self.chat_id, f, message_thread_id=tid, caption=cap)
+                    else:
+                        await self.app.bot.send_photo(self.chat_id, f, message_thread_id=tid, caption=cap)
+                STATE["metrics"]["messages_forwarded"] = STATE["metrics"].get("messages_forwarded", 0) + 1
+                save_state()
+                return
+        text = m.text or ""
+        if m.is_group and m.sender_name:
+            text = f"{m.sender_name}:\n{text}"
+        elif m.is_self:
+            text = f"🟢 我：{text}"
+        elif tid is None:
+            text = f"【{m.chat_name}】{text}"
+        await self.app.bot.send_message(self.chat_id, text, message_thread_id=tid)
+        STATE["metrics"]["messages_forwarded"] = STATE["metrics"].get("messages_forwarded", 0) + 1
+        save_state()
+
     async def _send_tg(self, m: Message):
         try:
-            tid = await self._topic_for(m.chat_id, m.chat_name, m.chat_number)
-            # 图片/视频：按 md5 在本地 nt_data 找明文文件，发真实媒体；找不到回退占位文本
-            if m.media in ("image", "video") and m.media_md5 and self.cfg.get("media_enabled", True):
-                path, kind = await asyncio.to_thread(
-                    mediafiles.find_media, self.home, m.media, m.media_md5)
-                if path:
-                    cap = self._caption(m)
-                    try:
-                        with open(path, "rb") as f:
-                            if kind == "video":
-                                await self.app.bot.send_video(self.chat_id, f, message_thread_id=tid, caption=cap)
-                            else:
-                                await self.app.bot.send_photo(self.chat_id, f, message_thread_id=tid, caption=cap)
-                        STATE["metrics"]["messages_forwarded"] = STATE["metrics"].get("messages_forwarded", 0) + 1
-                        save_state()
-                        return
-                    except Exception as e:  # noqa: BLE001
-                        print("发送媒体到 TG 失败，回退文本:", e, flush=True)
-            text = m.text or ""
-            if m.is_group and m.sender_name:
-                text = f"{m.sender_name}:\n{text}"
-            elif m.is_self:
-                text = f"🟢 我：{text}"
-            elif tid is None:
-                text = f"【{m.chat_name}】{text}"
-            await self.app.bot.send_message(self.chat_id, text, message_thread_id=tid)
-            STATE["metrics"]["messages_forwarded"] = STATE["metrics"].get("messages_forwarded", 0) + 1
-            save_state()
+            await self._deliver(m)
         except Exception as e:  # noqa: BLE001
-            print("发送到 TG 失败:", e, flush=True)
+            # 话题被删/失效 → 丢弃旧映射，重建话题后重试一次
+            if self._is_thread_gone(e) and self.map.get(m.chat_id):
+                self._drop_topic(m.chat_id)
+                try:
+                    await self._deliver(m)
+                    return
+                except Exception as e2:  # noqa: BLE001
+                    print("重建话题后仍失败:", e2, flush=True)
+            else:
+                print("发送到 TG 失败:", e, flush=True)
 
     # -------------------------------------------------- TG → QQ
     async def on_tg_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
