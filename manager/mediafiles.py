@@ -50,6 +50,8 @@ def find_image(home: str, md5: str) -> str | None:
         f"{d}/Emoji/*/*/Ori/{m}.*",
         f"{d}/Pic/*/Thumb/{m}_720.*",
         f"{d}/Pic/*/Thumb/{m}_0.*",
+        f"{d}/Pic/*/Thumb/{m}_*.*",   # 其它尺寸缩略图兜底（_198/_198_x 等）
+        f"{d}/Pic/*/*/{m}.*",         # 少见目录结构兜底
     ])
 
 

@@ -167,13 +167,23 @@ class Bridge:
             self._save_topics()
             print(f"[bridge] 话题已失效，丢弃旧映射并将重建：{chat_id} {info.get('name')}", flush=True)
 
+    async def _locate_media(self, m: Message, tries: int = 4, delay: float = 2.0):
+        """按 md5 找本地媒体文件；新消息刚入库时文件可能还在落盘，短暂重试再放弃。"""
+        for i in range(tries):
+            path, kind = await asyncio.to_thread(
+                mediafiles.find_media, self.home, m.media, m.media_md5)
+            if path:
+                return path, kind
+            if i < tries - 1:
+                await asyncio.sleep(delay)
+        return None, None
+
     async def _deliver(self, m: Message):
         """真正发送（话题不存在则 _topic_for 自动建）。失败抛出，交由 _send_tg 处理。"""
         tid = await self._topic_for(m.chat_id, m.chat_name, m.chat_number)
         # 图片/视频：按 md5 在本地 nt_data 找明文文件，发真实媒体；找不到回退占位文本
         if m.media in ("image", "video") and m.media_md5 and self.cfg.get("media_enabled", True):
-            path, kind = await asyncio.to_thread(
-                mediafiles.find_media, self.home, m.media, m.media_md5)
+            path, kind = await self._locate_media(m)
             if path:
                 cap = self._caption(m)
                 with open(path, "rb") as f:
