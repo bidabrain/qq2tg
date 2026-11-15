@@ -55,6 +55,7 @@ class Bridge:
         self._load_muted()
         self._mute_pending: dict[int, set[str]] = {}   # 菜单 message_id -> 暂存勾选
         self._recent_sent: list[tuple[str, str, float]] = []
+        self._dl_opened: dict[str, float] = {}   # chat_id -> 上次为下载而打开会话的时间（限流）
         self.col = Collector(self.home, on_message=self._on_qq)
 
     @staticmethod
@@ -178,8 +179,46 @@ class Bridge:
             self._save_topics()
             print(f"[bridge] 话题已失效，丢弃旧映射并将重建：{chat_id} {info.get('name')}", flush=True)
 
-    async def _locate_media(self, m: Message, tries: int = 4, delay: float = 2.0):
-        """按 md5 找本地媒体文件；新消息刚入库时文件可能还在落盘，短暂重试再放弃。"""
+    DL_COOLDOWN = 60.0   # 同一会话为触发下载而打开的最小间隔（秒），避免 UI 抖动
+
+    async def _trigger_qq_download(self, m: Message) -> bool:
+        """本地没有媒体文件时，QQ 多半是「懒加载」还没下载该会话的媒体。
+        用与回发同一套 UI 自动化打开该会话（滚到底），促使 QQ 把最新消息的媒体下到
+        本地 nt_data，之后 _locate_media 再找就有了。只打开不发消息。按会话限流。"""
+        if not self.cfg.get("media_download_on_open", True):
+            return False
+        now = time.time()
+        if now - self._dl_opened.get(m.chat_id, 0) < self.DL_COOLDOWN:
+            return False
+        self._dl_opened[m.chat_id] = now
+        number = m.chat_number or m.chat_id
+        name = m.chat_name or ""
+
+        def _open():
+            # 与 send 的回发共用 _LOCK，串行驱动 QQ 界面，避免互相打架
+            with send._LOCK:
+                err = send._open_target(number, name)
+                if not err:
+                    try:
+                        send._x("key", "End")   # 滚到最新，渲染触发下载
+                    except Exception:  # noqa: BLE001
+                        pass
+                return err
+
+        try:
+            err = await asyncio.to_thread(_open)
+        except Exception as e:  # noqa: BLE001
+            print("[bridge] 触发下载：打开会话异常:", e, flush=True)
+            return False
+        if err:
+            print(f"[bridge] 触发下载：打开会话失败 {m.chat_id} {name}: {err.get('msg')}", flush=True)
+            return False
+        print(f"[bridge] 触发下载：已打开会话「{name or m.chat_id}」，等 QQ 下载媒体", flush=True)
+        return True
+
+    async def _locate_media(self, m: Message, tries: int = 3, delay: float = 2.0):
+        """按 md5 找本地媒体文件；新消息刚入库时文件可能还在落盘，短暂重试再放弃。
+        仍找不到：QQ 懒加载还没下载 → 打开会话触发下载，再多找几轮。"""
         for i in range(tries):
             path, kind = await asyncio.to_thread(
                 mediafiles.find_media, self.home, m.media, m.media_md5)
@@ -187,6 +226,13 @@ class Bridge:
                 return path, kind
             if i < tries - 1:
                 await asyncio.sleep(delay)
+        if await self._trigger_qq_download(m):
+            for _ in range(5):
+                await asyncio.sleep(delay)
+                path, kind = await asyncio.to_thread(
+                    mediafiles.find_media, self.home, m.media, m.media_md5)
+                if path:
+                    return path, kind
         return None, None
 
     async def _deliver(self, m: Message):
