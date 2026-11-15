@@ -86,6 +86,11 @@ class NameResolver:
         self.ensure()
         return self._group.get(str(number))
 
+    def all_groups(self) -> dict[str, str]:
+        """所有群：群号 -> 群名。用于 /mute 菜单列出全部群。"""
+        self.ensure()
+        return dict(self._group)
+
     def user_name(self, uid: str = "", qq: str = "") -> str | None:
         self.ensure()
         return self._user.get(str(uid)) or (self._user.get(str(qq)) if qq else None)

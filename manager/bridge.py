@@ -28,11 +28,15 @@ except ImportError:  # 独立运行
     from collector import Collector, Message
     from common import DATA, STATE, save_state
 
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    MessageHandler, filters,
+)
 
 POLL_CONFIG_SEC = 5
 TOPICS_PATH = DATA / "topics.json"
+MUTED_PATH = DATA / "muted.json"
 
 
 class Bridge:
@@ -47,6 +51,9 @@ class Bridge:
         self.map: dict[str, dict] = {}           # qq_chat_id -> {topic_id, name}
         self.rev: dict[int, str] = {}
         self._load_topics()
+        self.muted: set[str] = set()             # 被屏蔽（不转发）的群号 chat_id
+        self._load_muted()
+        self._mute_pending: dict[int, set[str]] = {}   # 菜单 message_id -> 暂存勾选
         self._recent_sent: list[tuple[str, str, float]] = []
         self.col = Collector(self.home, on_message=self._on_qq)
 
@@ -83,6 +90,22 @@ class Bridge:
         except Exception as e:  # noqa: BLE001
             print("[bridge] 保存 topics 失败:", e, flush=True)
 
+    # -------------------------------------------------- 屏蔽名单（/mute）持久化
+    def _load_muted(self):
+        if MUTED_PATH.exists():
+            try:
+                self.muted = set(str(x) for x in json.loads(MUTED_PATH.read_text("utf-8")))
+            except Exception:  # noqa: BLE001
+                self.muted = set()
+
+    def _save_muted(self):
+        try:
+            tmp = MUTED_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(self.muted), ensure_ascii=False), "utf-8")
+            tmp.replace(MUTED_PATH)
+        except Exception as e:  # noqa: BLE001
+            print("[bridge] 保存屏蔽名单失败:", e, flush=True)
+
     async def _topic_for(self, chat_id: str, chat_name: str, number: str = "") -> int | None:
         hit = self.map.get(chat_id)
         if hit:
@@ -116,6 +139,9 @@ class Bridge:
         # 去回声：桥接刚发到 QQ 的消息会被采集回来，匹配到就跳过（不依赖方向判断，更稳）。
         # 自己从手机/其它 QQ 客户端发的消息不在此列，照常转发（带「🟢 我」前缀）。
         if self._is_echo(m):
+            return
+        # /mute 屏蔽的群：直接忽略，不转发到 TG
+        if m.is_group and m.chat_id in self.muted:
             return
         asyncio.run_coroutine_threadsafe(self._send_tg(m), self.loop)
 
@@ -294,11 +320,82 @@ class Bridge:
             msg += f"；{failed} 个失败，可稍后再 /synctopic 重试"
         await m.reply_text(msg)
 
+    # -------------------------------------------------- /mute 屏蔽群菜单
+    async def _group_choices(self) -> list[tuple[str, str]]:
+        """返回 [(群号, 群名)]，按名称排序；已屏蔽但已不在群列表里的也带上，便于取消屏蔽。"""
+        groups = await asyncio.to_thread(self.col.names.all_groups)
+        merged = dict(groups)
+        for gid in self.muted:
+            merged.setdefault(gid, groups.get(gid) or gid)
+        return sorted(merged.items(), key=lambda kv: (kv[1] or kv[0]))
+
+    def _mute_keyboard(self, choices, pend: set[str]) -> InlineKeyboardMarkup:
+        rows = []
+        for gid, name in choices:
+            mark = "✅" if gid in pend else "⬜"
+            label = f"{mark} {(name or gid)[:40]}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"m:t:{gid}")])
+        rows.append([InlineKeyboardButton(
+            f"💾 提交（屏蔽 {len(pend)} 个群）", callback_data="m:s")])
+        return InlineKeyboardMarkup(rows)
+
+    async def cmd_mute(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """列出所有群，勾选要屏蔽（不转发）的群，点「提交」生效。再次 /mute 显示当前勾选状态。"""
+        m = update.effective_message
+        choices = await self._group_choices()
+        if not choices:
+            await m.reply_text("没取到群列表（QQ 是否已登录并取到密钥？可稍后再试或先 /synctopic）。")
+            return
+        pend = set(self.muted)                      # 初始勾选 = 当前已屏蔽
+        sent = await m.reply_text(
+            "🔇 勾选要屏蔽（不转发到 TG）的群，点一下切换 ✅/⬜，改好后点底部「提交」：",
+            reply_markup=self._mute_keyboard(choices, pend))
+        self._mute_pending[sent.message_id] = pend
+
+    async def on_mute_cb(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        if not q or not q.message or q.message.chat_id != self.chat_id:
+            return
+        mid = q.message.message_id
+        data = q.data or ""
+        pend = self._mute_pending.get(mid)
+        if pend is None:                            # bot 重启后菜单失效 → 以当前屏蔽名单重建
+            pend = set(self.muted)
+            self._mute_pending[mid] = pend
+        if data == "m:s":                           # 提交
+            self.muted = set(pend)
+            self._save_muted()
+            self._mute_pending.pop(mid, None)
+            if self.muted:
+                names = await self._group_choices()
+                nmap = dict(names)
+                lst = "\n".join("· " + (nmap.get(g) or g) for g in sorted(self.muted))
+                txt = f"✅ 已屏蔽 {len(self.muted)} 个群（这些群的消息不再转发）：\n{lst}"
+            else:
+                txt = "✅ 已提交：当前没有屏蔽任何群。"
+            await q.answer("已保存")
+            await q.edit_message_text(txt)
+            return
+        if data.startswith("m:t:"):                 # 切换某个群
+            gid = data[4:]
+            if gid in pend:
+                pend.discard(gid)
+            else:
+                pend.add(gid)
+            choices = await self._group_choices()
+            await q.answer()
+            try:
+                await q.edit_message_reply_markup(self._mute_keyboard(choices, pend))
+            except Exception:  # noqa: BLE001  内容未变等
+                pass
+
     # -------------------------------------------------- 运行
     async def run(self):
         self.app = Application.builder().token(self.cfg["tg_bot_token"]).build()
         self.app.add_handler(CommandHandler("contacts", self.cmd_contacts, filters.Chat(self.chat_id)))
         self.app.add_handler(CommandHandler("synctopic", self.cmd_synctopic, filters.Chat(self.chat_id)))
+        self.app.add_handler(CommandHandler("mute", self.cmd_mute, filters.Chat(self.chat_id)))
+        self.app.add_handler(CallbackQueryHandler(self.on_mute_cb, pattern=r"^m:"))
         self.app.add_handler(MessageHandler(
             filters.Chat(self.chat_id) & filters.TEXT & ~filters.COMMAND, self.on_tg_message))
         self.app.add_handler(MessageHandler(
@@ -369,6 +466,7 @@ class Bridge:
             await self.app.bot.set_my_commands([
                 BotCommand("contacts", "最近会话（可带关键词）"),
                 BotCommand("synctopic", "重新同步昵称/群名到话题标题"),
+                BotCommand("mute", "屏蔽/取消屏蔽某些群（勾选后提交）"),
             ], scope=BotCommandScopeDefault())
             print("[bridge] 已清理旧命令并设置菜单", flush=True)
         except Exception as e:  # noqa: BLE001
