@@ -350,31 +350,41 @@ class Bridge:
         sent = await m.reply_text(
             "🔇 勾选要屏蔽（不转发到 TG）的群，点一下切换 ✅/⬜，改好后点底部「提交」：",
             reply_markup=self._mute_keyboard(choices, pend))
-        self._mute_pending[sent.message_id] = pend
+        # 连同群列表一起缓存，切换时直接用，不必每次点击都去解密 DB（更快更稳）
+        self._mute_pending[sent.message_id] = {"pend": pend, "choices": choices}
 
     async def on_mute_cb(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
-        if not q or not q.message or q.message.chat_id != self.chat_id:
+        if not q:
             return
-        mid = q.message.message_id
+        try:
+            await q.answer()                        # 先消掉转圈，再处理
+        except Exception:  # noqa: BLE001
+            pass
+        msg = q.message
+        if not msg:
+            return
+        mid = msg.message_id
         data = q.data or ""
-        pend = self._mute_pending.get(mid)
-        if pend is None:                            # bot 重启后菜单失效 → 以当前屏蔽名单重建
-            pend = set(self.muted)
-            self._mute_pending[mid] = pend
+        st = self._mute_pending.get(mid)
+        if st is None:                              # bot 重启后菜单失效 → 以当前屏蔽名单重建
+            st = {"pend": set(self.muted), "choices": await self._group_choices()}
+            self._mute_pending[mid] = st
+        pend, choices = st["pend"], st["choices"]
         if data == "m:s":                           # 提交
             self.muted = set(pend)
             self._save_muted()
             self._mute_pending.pop(mid, None)
+            nmap = dict(choices)
             if self.muted:
-                names = await self._group_choices()
-                nmap = dict(names)
                 lst = "\n".join("· " + (nmap.get(g) or g) for g in sorted(self.muted))
                 txt = f"✅ 已屏蔽 {len(self.muted)} 个群（这些群的消息不再转发）：\n{lst}"
             else:
                 txt = "✅ 已提交：当前没有屏蔽任何群。"
-            await q.answer("已保存")
-            await q.edit_message_text(txt)
+            try:
+                await q.edit_message_text(txt)
+            except Exception as e:  # noqa: BLE001
+                print("[mute] 提交改文本失败:", e, flush=True)
             return
         if data.startswith("m:t:"):                 # 切换某个群
             gid = data[4:]
@@ -382,12 +392,10 @@ class Bridge:
                 pend.discard(gid)
             else:
                 pend.add(gid)
-            choices = await self._group_choices()
-            await q.answer()
             try:
                 await q.edit_message_reply_markup(self._mute_keyboard(choices, pend))
-            except Exception:  # noqa: BLE001  内容未变等
-                pass
+            except Exception as e:  # noqa: BLE001  内容未变等
+                print("[mute] 切换改键盘失败:", e, flush=True)
 
     # -------------------------------------------------- 运行
     async def run(self):
@@ -410,7 +418,10 @@ class Bridge:
         print(f"[bridge] 已启动，目标群 chat_id={self.chat_id}，已载入 {len(self.map)} 个 topic 映射", flush=True)
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)
+        # 必须显式带上 callback_query：Telegram 会记住上一次 getUpdates 的 allowed_updates，
+        # 旧程序可能只订阅了 message，导致内联按钮回调收不到（/mute 勾选点了没反应）。
+        await self.app.updater.start_polling(
+            drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
         await self._reset_commands()
         try:
             await self.app.bot.send_message(self.chat_id, "✅ qq2tg 桥接已连接（Topic 模式）。")
