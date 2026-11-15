@@ -61,12 +61,23 @@ class Bridge:
     def _norm(s: str) -> str:
         return "".join((s or "").split())
 
+    # 媒体类消息的正文是占位符，发回 QQ 后回采可能是 image/video，也可能被 QQ 存成
+    # 「文件」（正文 [文件]）或表情，都要能对上发送端记录的 \x00MEDIA，否则媒体回声。
+    _MEDIA_PLACEHOLDERS = ("[图片]", "[视频]", "[文件]", "[表情]", "[动画表情]", "[媒体]")
+
+    def _echo_key(self, m: "Message") -> str:
+        if m.media in ("image", "video"):
+            return "\x00MEDIA"
+        t = (m.text or "").lstrip()
+        if any(t.startswith(p) for p in self._MEDIA_PLACEHOLDERS):
+            return "\x00MEDIA"
+        return self._norm(m.text)
+
     def _is_echo(self, m: "Message") -> bool:
         now = time.time()
         self._recent_sent = [e for e in self._recent_sent if now - e[2] < 120]
-        # 媒体消息的正文是占位([图片]/[视频])，无法按文本匹配；统一用 \x00MEDIA 作 key，
-        # 与 on_tg_photo/on_tg_video 记录的一致，从而正确识别桥接自己发的媒体、去回声。
-        key = "\x00MEDIA" if m.media in ("image", "video") else self._norm(m.text)
+        # 统一用 \x00MEDIA 作媒体 key，与 on_tg_photo/on_tg_video 记录的一致，去回声。
+        key = self._echo_key(m)
         for i, (cid, txt, _) in enumerate(self._recent_sent):
             if cid == m.chat_id and txt == key:
                 self._recent_sent.pop(i)
