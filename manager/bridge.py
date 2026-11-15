@@ -202,8 +202,20 @@ class Bridge:
         r = await asyncio.to_thread(send.send_to_chat, number, chat_id, msg.text, name)
         if r.get("ok"):
             self._recent_sent.append((chat_id, self._norm(msg.text), time.time()))
+            await self._notify_if_muted(msg, chat_id)
         else:
             await msg.reply_text(f"❌ 发送失败：{r.get('msg')}")
+
+    async def _notify_if_muted(self, msg, chat_id: str):
+        """被 /mute 的群：回复仍发到 QQ，但该群消息不会转发回来，回复后提醒一次。"""
+        if chat_id not in self.muted:
+            return
+        try:
+            await msg.reply_text(
+                "🔇 该群已被 /mute 屏蔽：你的回复已发到 QQ，但这个群的新消息"
+                "不会转发到这里。想重新接收该群消息，请 /mute 取消勾选它。")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _target(self, msg):
         """从 TG 话题消息解析出 (chat_id, 号码, 群名)；非映射话题返回 None。"""
@@ -231,6 +243,7 @@ class Bridge:
             r = await asyncio.to_thread(send.send_image_to_chat, number, chat_id, str(tmp), name)
             if r.get("ok"):
                 self._recent_sent.append((chat_id, "\x00MEDIA", time.time()))
+                await self._notify_if_muted(msg, chat_id)
             else:
                 await msg.reply_text(f"❌ 图片发送失败：{r.get('msg')}")
         except Exception as e:  # noqa: BLE001
@@ -250,7 +263,7 @@ class Bridge:
         media_obj = (msg.video or msg.animation or msg.document) if msg else None
         if not tgt or not media_obj:
             return
-        chat_id, number = tgt
+        chat_id, number, name = tgt
         ext = "mp4" if (msg.video or msg.animation) else "bin"
         tmp = DATA / "media" / f"tg_{msg.message_id}.{ext}"
         tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -260,6 +273,7 @@ class Bridge:
             r = await asyncio.to_thread(send.send_file_to_chat, number, chat_id, str(tmp), name)
             if r.get("ok"):
                 self._recent_sent.append((chat_id, "\x00MEDIA", time.time()))
+                await self._notify_if_muted(msg, chat_id)
             else:
                 await msg.reply_text(f"❌ 视频/文件发送失败：{r.get('msg')}")
         except Exception as e:  # noqa: BLE001
