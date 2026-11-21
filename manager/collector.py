@@ -180,25 +180,79 @@ class Collector:
                 continue
         return (0, 0)
 
+    def _max_rowids(self) -> dict[str, int]:
+        """各表当前最大 rowid，作监听基线。只读 max(rowid)、不解析正文，很便宜。"""
+        con = self._open()
+        if not con:
+            return {}
+        cur: dict[str, int] = {}
+        try:
+            existing = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in TABLES:
+                if table not in existing:
+                    continue
+                try:
+                    r = con.execute(f"SELECT max(rowid) FROM {table}").fetchone()
+                    cur[table] = (r[0] if r else 0) or 0
+                except Exception:  # noqa: BLE001
+                    cur[table] = 0
+        finally:
+            con.close()
+        return cur
+
+    def _fetch_new(self, cursors: dict[str, int]):
+        """只取各表 rowid 大于游标的新消息，只解析这些新行。返回 (新消息列表, 更新后游标)。
+        rowid 随插入单调递增，天然增量——不必每次把整库历史全解密重解析（原实现的 CPU 根源）。"""
+        con = self._open()
+        if not con:
+            return [], cursors
+        out: list[Message] = []
+        newcur = dict(cursors)
+        try:
+            existing = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            sel = ",".join(f'"{c}"' for c in COLS)
+            for table, is_group in TABLES.items():
+                if table not in existing:
+                    continue
+                last = cursors.get(table, 0)
+                try:
+                    cur = con.execute(
+                        f"SELECT rowid,{sel} FROM {table} WHERE rowid > ? ORDER BY rowid", (last,))
+                except Exception:  # noqa: BLE001  列缺失等
+                    continue
+                mx = last
+                for row in cur:
+                    rid = row[0]
+                    if rid > mx:
+                        mx = rid
+                    m = self._row_to_msg(table, is_group, row[1:])
+                    if m:
+                        out.append(m)
+                newcur[table] = mx
+        finally:
+            con.close()
+        return out, newcur
+
     def poll_loop(self, interval: float = 1.0):
-        """建立基线后持续监听，新消息经 on_message 回调。阻塞运行。"""
+        """建立基线后持续监听，新消息经 on_message 回调。阻塞运行。
+        增量：只处理 rowid 大于基线的新消息，不再每轮全库解密重解析。"""
         if not self.refresh_key():
             raise RuntimeError("未取到密钥，QQ 可能未登录")
-        prev = set(self.snapshot().keys())
+        cursors = self._max_rowids()          # 基线：各表当前最大 rowid（不重放历史）
         sig = self._wal_sig()
         while True:
             cur_sig = self._wal_sig()
             if cur_sig != sig:
                 sig = cur_sig
-                cur = self.snapshot()
-                new = [k for k in cur if k not in prev]
-                for k in sorted(new, key=lambda k: cur[k].time):
+                new_msgs, cursors = self._fetch_new(cursors)
+                for m in sorted(new_msgs, key=lambda m: m.time):
                     if self.on_message:
                         try:
-                            self.on_message(cur[k])
+                            self.on_message(m)
                         except Exception as e:  # noqa: BLE001
                             print("on_message 异常:", e, flush=True)
-                prev = set(cur.keys())
             time.sleep(interval)
 
 

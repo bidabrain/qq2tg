@@ -283,11 +283,26 @@ def find_working_key(db_path: str, work_dir: str, pid: int | None = None,
     return None
 
 
+# 记录上次剥头时主库的 (mtime,size)。主库只在 checkpoint 时变，大多数新消息只进 WAL，
+# 故主库没变就复用已剥头副本、只重同步 WAL，避免每次 open 都整文件重拷（原 CPU/IO 大头之一）。
+_STRIP_SIG: dict[str, tuple] = {}
+
+
 def open_decrypted(db_path: str, cred: dict, work_dir: str, name: str = "nt_msg"):
     """按已知密钥打开（剥头 + 同步 WAL + 试开），返回 sqlcipher 连接。失败返回 None。"""
     os.makedirs(work_dir, exist_ok=True)
-    clear = strip_header(db_path, os.path.join(work_dir, f"{name}_clear.db"))
-    _sync_wal(db_path, clear)
+    clear = os.path.join(work_dir, f"{name}_clear.db")
+    try:
+        st = os.stat(db_path)
+        sig = (st.st_mtime, st.st_size)
+    except OSError:
+        sig = None
+    # 主库(mtime,size)没变且副本在，就跳过整文件重拷；否则重新剥头
+    if sig is None or _STRIP_SIG.get(db_path) != sig or not os.path.exists(clear):
+        strip_header(db_path, clear)
+        if sig is not None:
+            _STRIP_SIG[db_path] = sig
+    _sync_wal(db_path, clear)                 # WAL 总是重同步（文件小，便宜）
     cand = {"kind": cred["kind"], "key": cred["key"], "salt": cred.get("salt")}
     # 复用已知形态，避免每次 open 都重探失败形态（减少 sqlcipher 错误日志、提速）
     con, _ = _try_open(clear, cand, only_variant=cred.get("variant"))
