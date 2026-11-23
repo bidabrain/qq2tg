@@ -61,6 +61,7 @@ class Collector:
         self.on_message = on_message
         self.cred: dict | None = None
         self.names = NameResolver(home)
+        self._cursors: dict[str, int] | None = None   # 监听基线，跨 poll_loop 重启保留，避免丢消息
         os.makedirs(PLAIN_DIR, exist_ok=True)
 
     # -------------------------------------------------------------- 密钥
@@ -180,11 +181,12 @@ class Collector:
                 continue
         return (0, 0)
 
-    def _max_rowids(self) -> dict[str, int]:
-        """各表当前最大 rowid，作监听基线。只读 max(rowid)、不解析正文，很便宜。"""
+    def _max_rowids(self) -> dict[str, int] | None:
+        """各表当前最大 rowid，作监听基线。只读 max(rowid)、不解析正文，很便宜。
+        打不开库时返回 None（非空 dict），调用方据此重试，切忌当成空基线把整库历史全重放。"""
         con = self._open()
         if not con:
-            return {}
+            return None
         cur: dict[str, int] = {}
         try:
             existing = {r[0] for r in con.execute(
@@ -237,16 +239,31 @@ class Collector:
 
     def poll_loop(self, interval: float = 1.0):
         """建立基线后持续监听，新消息经 on_message 回调。阻塞运行。
-        增量：只处理 rowid 大于基线的新消息，不再每轮全库解密重解析。"""
+        增量：只处理 rowid 大于基线的新消息，不再每轮全库解密重解析。
+
+        健壮性：基线 self._cursors 存在实例上、跨 poll_loop 重启保留——即便本函数因偶发
+        malformed 抛出被外层 5s 后重进，也从上次游标继续，不把基线重置到「当前」而丢掉
+        崩溃窗口内的消息。读失败（撕裂拷贝）只保留 sig 下一轮重试，游标不动故不漏不重。"""
         if not self.refresh_key():
             raise RuntimeError("未取到密钥，QQ 可能未登录")
-        cursors = self._max_rowids()          # 基线：各表当前最大 rowid（不重放历史）
+        # 基线只建一次且必须成功；打不开库时 _max_rowids 返回 None，等拿到自洽快照再进监听，
+        # 绝不用空基线(会把整库历史全重放到 TG)。跨 poll_loop 重启保留，故重进不会重置基线。
+        while self._cursors is None:
+            self._cursors = self._max_rowids()
+            if self._cursors is None:
+                time.sleep(1.0)
         sig = self._wal_sig()
         while True:
             cur_sig = self._wal_sig()
             if cur_sig != sig:
+                try:
+                    new_msgs, newcur = self._fetch_new(self._cursors)
+                except Exception as e:  # noqa: BLE001  撕裂拷贝等偶发错误
+                    print("[collector] 取新消息失败，保留游标下轮重试:", e, flush=True)
+                    time.sleep(interval)
+                    continue            # 不推进 sig：下轮 WAL 仍异于 sig，会再取（游标未动，不漏）
+                self._cursors = newcur
                 sig = cur_sig
-                new_msgs, cursors = self._fetch_new(cursors)
                 for m in sorted(new_msgs, key=lambda m: m.time):
                     if self.on_message:
                         try:

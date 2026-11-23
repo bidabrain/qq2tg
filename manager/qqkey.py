@@ -21,6 +21,7 @@ import glob
 import os
 import re
 import shutil
+import time
 from pathlib import Path
 
 HEADER_SIZE = 1024
@@ -253,6 +254,20 @@ def _clear_name(db_path: str) -> str:
     return os.path.basename(db_path).replace(".db", "") + "_clear.db"
 
 
+def _clear_path(work_dir: str, name: str) -> str:
+    """每进程独立的剥头副本路径。bridge 与面板是两个进程、共用 /data/plain，
+    若写同一副本文件会互相覆盖→读到半截→malformed，故副本名带 PID 隔离。"""
+    return os.path.join(work_dir, f"{name}_{os.getpid()}_clear.db")
+
+
+def _stat_sig(p: str):
+    try:
+        st = os.stat(p)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
 def find_working_key(db_path: str, work_dir: str, pid: int | None = None,
                      try_ascii: bool = True) -> dict | None:
     """扫描内存 + 逐候选试开，返回命中的 {key, kind, variant, salt} 或 None。
@@ -262,7 +277,7 @@ def find_working_key(db_path: str, work_dir: str, pid: int | None = None,
         return None
     salt_hex = read_salt(db_path)
     os.makedirs(work_dir, exist_ok=True)
-    clear = strip_header(db_path, os.path.join(work_dir, _clear_name(db_path)))
+    clear = strip_header(db_path, _clear_path(work_dir, os.path.basename(db_path).replace(".db", "")))
     _sync_wal(db_path, clear)
 
     cands = scan_memory_candidates(pid, salt_hex)
@@ -283,17 +298,34 @@ def find_working_key(db_path: str, work_dir: str, pid: int | None = None,
     return None
 
 
-def open_decrypted(db_path: str, cred: dict, work_dir: str, name: str = "nt_msg"):
+def open_decrypted(db_path: str, cred: dict, work_dir: str, name: str = "nt_msg",
+                   tries: int = 4, backoff: float = 0.3):
     """按已知密钥打开（剥头 + 同步 WAL + 试开），返回 sqlcipher 连接。失败返回 None。
-    注意：必须每次重新剥头主库再同步 WAL，二者要取自同一时刻，否则主库副本旧、WAL 新
-    会不一致导致「database disk image is malformed」。曾试过缓存主库副本，因此 bug 已回退。"""
+
+    必须每次重新剥头主库再同步 WAL，二者要取自同一时刻，否则主库副本与 WAL 不一致
+    会「database disk image is malformed」。QQ 在实时写库/checkpoint，整库拷贝期间若被
+    写到（尤其 checkpoint 改写 page1）就会拿到撕裂副本 → page1 hmac 失败 → malformed。
+    故做「一致性拷贝」：拷贝前后比对主库 mtime/size，期间变过就重拷；拿到自洽快照再打开。
+    曾试过缓存主库副本（主库旧+WAL新）导致 malformed，已回退，这里不缓存、每次重拷但带重试。"""
     os.makedirs(work_dir, exist_ok=True)
-    clear = strip_header(db_path, os.path.join(work_dir, f"{name}_clear.db"))
-    _sync_wal(db_path, clear)
+    clear = _clear_path(work_dir, name)
     cand = {"kind": cred["kind"], "key": cred["key"], "salt": cred.get("salt")}
-    # 复用已知形态，避免每次 open 都重探失败形态（减少 sqlcipher 错误日志、提速）
-    con, _ = _try_open(clear, cand, only_variant=cred.get("variant"))
-    return con
+    n = max(tries, 1)
+    for i in range(n):
+        before = _stat_sig(db_path)
+        strip_header(db_path, clear)          # 注意：复用同一 clear 文件，故不可跨轮持有旧连接
+        _sync_wal(db_path, clear)
+        stable = before is not None and before == _stat_sig(db_path)   # 拷贝期间主库未变=自洽
+        last_try = (i + 1 >= n)
+        # 复用已知形态，避免每次 open 都重探失败形态（减少 sqlcipher 错误日志、提速）
+        con, _ = _try_open(clear, cand, only_variant=cred.get("variant"))
+        if con and (stable or last_try):
+            return con                        # 自洽快照直接用；末轮即便可能不一致也兜底返回
+        if con:
+            con.close()                       # 非自洽且还有重试机会：丢弃，下一轮会覆写 clear
+        if not last_try:
+            time.sleep(backoff)
+    return None
 
 
 def open_db(db_path: str, work_dir: str, pid: int | None = None):
