@@ -148,6 +148,13 @@ class Bridge:
     def _on_qq(self, m: Message):
         if not self.cfg.get("forward_enabled", True) or not self.loop or not self.app:
             return
+        # 灰字提示/系统消息（戳一戳/拍一拍/撤回/入群退群/红包提示…，content_type=8，
+        # 正文为 QQ 的 <gtip> 提示而非聊天内容）渲染不出正文、render_body 回「[空消息]」，
+        # 默认不转发，免得「[空消息]」刷屏。媒体消息正文是「[图片]/[视频]」非空、不受影响；
+        # 需要的话配置 forward_system_tips=true 打开。
+        if (m.media is None and (not m.text or m.text == "[空消息]")
+                and not self.cfg.get("forward_system_tips", False)):
+            return
         # 去回声：桥接刚发到 QQ 的消息会被采集回来，匹配到就跳过（不依赖方向判断，更稳）。
         # 自己从手机/其它 QQ 客户端发的消息不在此列，照常转发（带「🟢 我」前缀）。
         if self._is_echo(m):
