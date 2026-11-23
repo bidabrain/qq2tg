@@ -29,6 +29,7 @@ except ImportError:  # 独立运行
     from common import DATA, STATE, save_state
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
@@ -56,6 +57,10 @@ class Bridge:
         self._mute_pending: dict[int, set[str]] = {}   # 菜单 message_id -> 暂存勾选
         self._recent_sent: list[tuple[str, str, float]] = []
         self._dl_opened: dict[str, float] = {}   # chat_id -> 上次为下载而打开会话的时间（限流）
+        # QQ→TG 发送队列：串行消费，避免对每条消息并发 send 把 PTB 连接池占满
+        # （曾因此大量 "Pool timeout" / "Timed out" / "Flood control" 失败→消息到不了 TG）。
+        self._send_q: asyncio.Queue | None = None
+        self._send_gap = float(cfg.get("tg_send_gap", 0.3))   # 相邻发送最小间隔，缓解限流
         self.col = Collector(self.home, on_message=self._on_qq)
 
     @staticmethod
@@ -162,7 +167,17 @@ class Bridge:
         # /mute 屏蔽的群：直接忽略，不转发到 TG
         if m.is_group and m.chat_id in self.muted:
             return
-        asyncio.run_coroutine_threadsafe(self._send_tg(m), self.loop)
+        # 入队（串行消费），不再对每条消息并发 send。_on_qq 在采集线程，跨线程调度到事件循环。
+        if self._send_q is not None and self.loop is not None:
+            self.loop.call_soon_threadsafe(self._enqueue, m)
+
+    def _enqueue(self, m: "Message"):
+        if self._send_q is None:
+            return
+        try:
+            self._send_q.put_nowait(m)
+        except asyncio.QueueFull:
+            print("[bridge] 发送队列已满，丢弃一条（TG 侧持续发送失败？）", flush=True)
 
     def _caption(self, m: Message) -> str | None:
         if m.is_group and m.sender_name:
@@ -243,7 +258,7 @@ class Bridge:
         return None, None
 
     async def _deliver(self, m: Message):
-        """真正发送（话题不存在则 _topic_for 自动建）。失败抛出，交由 _send_tg 处理。"""
+        """真正发送（话题不存在则 _topic_for 自动建）。失败抛出，交由 _deliver_with_retry 处理。"""
         tid = await self._topic_for(m.chat_id, m.chat_name, m.chat_number)
         # 图片/视频：按 md5 在本地 nt_data 找明文文件，发真实媒体；找不到回退占位文本
         if m.media in ("image", "video") and m.media_md5 and self.cfg.get("media_enabled", True):
@@ -269,20 +284,42 @@ class Bridge:
         STATE["metrics"]["messages_forwarded"] = STATE["metrics"].get("messages_forwarded", 0) + 1
         save_state()
 
-    async def _send_tg(self, m: Message):
-        try:
-            await self._deliver(m)
-        except Exception as e:  # noqa: BLE001
-            # 话题被删/失效 → 丢弃旧映射，重建话题后重试一次
-            if self._is_thread_gone(e) and self.map.get(m.chat_id):
-                self._drop_topic(m.chat_id)
-                try:
-                    await self._deliver(m)
-                    return
-                except Exception as e2:  # noqa: BLE001
-                    print("重建话题后仍失败:", e2, flush=True)
-            else:
+    async def _send_worker(self):
+        """串行消费发送队列：一次只发一条，相邻间隔 _send_gap，避免并发占满连接池/触发限流。
+        单条带重试：限流(RetryAfter)按服务器要求等待、超时/网络错误退避重试、话题失效则重建。"""
+        assert self._send_q is not None
+        while True:
+            m = await self._send_q.get()
+            try:
+                await self._deliver_with_retry(m)
+            except Exception as e:  # noqa: BLE001
+                print("发送到 TG 失败(worker):", e, flush=True)
+            finally:
+                self._send_q.task_done()
+            if self._send_gap > 0:
+                await asyncio.sleep(self._send_gap)
+
+    async def _deliver_with_retry(self, m: Message, tries: int = 5):
+        last = None
+        for _ in range(tries):
+            try:
+                await self._deliver(m)
+                return
+            except RetryAfter as e:                       # 触发 Telegram 限流：按要求等待后重试
+                last = e
+                await asyncio.sleep(getattr(e, "retry_after", 5) + 1)
+            except (TimedOut, NetworkError) as e:         # 超时/网络抖动：短退避重试
+                last = e
+                await asyncio.sleep(1.5)
+            except Exception as e:                        # noqa: BLE001
+                # 话题被删/失效 → 丢弃旧映射，下一轮 _deliver 会自动重建话题
+                if self._is_thread_gone(e) and self.map.get(m.chat_id):
+                    self._drop_topic(m.chat_id)
+                    last = e
+                    continue
                 print("发送到 TG 失败:", e, flush=True)
+                return
+        print("发送到 TG 重试多次仍失败，放弃一条:", last, flush=True)
 
     # -------------------------------------------------- TG → QQ
     async def on_tg_message(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -512,7 +549,16 @@ class Bridge:
 
     # -------------------------------------------------- 运行
     async def run(self):
-        self.app = Application.builder().token(self.cfg["tg_bot_token"]).build()
+        # 加大连接池与超时：默认池很小，QQ→TG 并发/媒体上传时极易 "Pool timeout" / "Timed out"。
+        self.app = (Application.builder()
+                    .token(self.cfg["tg_bot_token"])
+                    .connection_pool_size(16)
+                    .pool_timeout(20.0)
+                    .connect_timeout(20.0)
+                    .read_timeout(30.0)
+                    .write_timeout(60.0)
+                    .get_updates_read_timeout(40.0)
+                    .build())
         self.app.add_handler(CommandHandler("contacts", self.cmd_contacts, filters.Chat(self.chat_id)))
         self.app.add_handler(CommandHandler("synctopic", self.cmd_synctopic, filters.Chat(self.chat_id)))
         self.app.add_handler(CommandHandler("mute", self.cmd_mute, filters.Chat(self.chat_id)))
@@ -525,6 +571,8 @@ class Bridge:
             filters.Chat(self.chat_id) & (filters.VIDEO | filters.ANIMATION | filters.Document.ALL),
             self.on_tg_video))
         self.loop = asyncio.get_running_loop()
+        self._send_q = asyncio.Queue(maxsize=2000)   # QQ→TG 串行发送队列
+        asyncio.create_task(self._send_worker())
         self._clean_media(0)                 # 启动清空残留的下载临时文件
         asyncio.create_task(self._media_cleaner())
         threading.Thread(target=self._collector_loop, daemon=True).start()
