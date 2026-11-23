@@ -26,6 +26,9 @@ except ImportError:  # 独立运行
     from names import NameResolver
 
 PLAIN_DIR = os.environ.get("PLAIN_DIR", "/data/plain")
+# 增量监听的时间窗口（秒）：每轮只看最近这段时间的消息，用 msg_id 去重判新。
+# 要大于「采集偶发失败/poll_loop 重启」的最长间隔(bridge 5s 重进)，留足余量。
+WINDOW_S = int(os.environ.get("COLLECT_WINDOW_S", "300"))
 
 # 顶层行列（按此顺序 SELECT，用下标取）
 COLS = ["40001", "40050", "40013", "40011", "40012",
@@ -61,7 +64,10 @@ class Collector:
         self.on_message = on_message
         self.cred: dict | None = None
         self.names = NameResolver(home)
-        self._cursors: dict[str, int] | None = None   # 监听基线，跨 poll_loop 重启保留，避免丢消息
+        # 监听「已见」基线：窗口内已出现过的 (表, msg_id) 集合。跨 poll_loop 重启保留，
+        # 既不重放历史也不漏崩溃窗口内的消息。改用「集合去重」而非「rowid 游标」，
+        # 因 QQ 的 40001(msg_id,即 rowid/PK) 是非单调雪花号，rowid>基线 会永久漏掉绝大多数新消息。
+        self._seen: set[tuple[str, int]] | None = None
         os.makedirs(PLAIN_DIR, exist_ok=True)
 
     # -------------------------------------------------------------- 密钥
@@ -181,88 +187,71 @@ class Collector:
                 continue
         return (0, 0)
 
-    def _max_rowids(self) -> dict[str, int] | None:
-        """各表当前最大 rowid，作监听基线。只读 max(rowid)、不解析正文，很便宜。
-        打不开库时返回 None（非空 dict），调用方据此重试，切忌当成空基线把整库历史全重放。"""
+    def _scan_window(self, cutoff: int) -> dict[tuple[str, int], Message] | None:
+        """返回最近 cutoff 之后(按时间列 40050)各表的 {(表, msg_id): Message}。
+        打不开库时返回 None（非空 dict），调用方据此重试，不把它当成空结果。
+
+        为何按时间窗口 + msg_id 去重，而非 rowid 游标：QQ 的 40001(=PK=rowid) 是非单调的
+        64 位雪花号，新消息的 msg_id 常小于历史最大值，`rowid>基线` 会把它们永久漏掉
+        （正是「群消息在 TG 收不到」的根因）。窗口内按实际出现的 msg_id 判新，不依赖任何
+        单调性假设，也抗乱序落库。只扫整型时间列(约 90ms)并仅解析窗口内那几条正文，
+        远轻于早期「每轮解析全库 blob」的高 CPU 做法。"""
         con = self._open()
         if not con:
             return None
-        cur: dict[str, int] = {}
+        res: dict[tuple[str, int], Message] = {}
+        sel = ",".join(f'"{c}"' for c in COLS)
         try:
             existing = {r[0] for r in con.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
-            for table in TABLES:
-                if table not in existing:
-                    continue
-                try:
-                    r = con.execute(f"SELECT max(rowid) FROM {table}").fetchone()
-                    cur[table] = (r[0] if r else 0) or 0
-                except Exception:  # noqa: BLE001
-                    cur[table] = 0
-        finally:
-            con.close()
-        return cur
-
-    def _fetch_new(self, cursors: dict[str, int]):
-        """只取各表 rowid 大于游标的新消息，只解析这些新行。返回 (新消息列表, 更新后游标)。
-        rowid 随插入单调递增，天然增量——不必每次把整库历史全解密重解析（原实现的 CPU 根源）。"""
-        con = self._open()
-        if not con:
-            return [], cursors
-        out: list[Message] = []
-        newcur = dict(cursors)
-        try:
-            existing = {r[0] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-            sel = ",".join(f'"{c}"' for c in COLS)
             for table, is_group in TABLES.items():
                 if table not in existing:
                     continue
-                last = cursors.get(table, 0)
                 try:
                     cur = con.execute(
-                        f"SELECT rowid,{sel} FROM {table} WHERE rowid > ? ORDER BY rowid", (last,))
+                        f'SELECT {sel} FROM {table} WHERE "40050" >= ?', (cutoff,))
                 except Exception:  # noqa: BLE001  列缺失等
                     continue
-                mx = last
                 for row in cur:
-                    rid = row[0]
-                    if rid > mx:
-                        mx = rid
-                    m = self._row_to_msg(table, is_group, row[1:])
+                    m = self._row_to_msg(table, is_group, row)
                     if m:
-                        out.append(m)
-                newcur[table] = mx
+                        res[(table, m.msg_id)] = m
         finally:
             con.close()
-        return out, newcur
+        return res
 
     def poll_loop(self, interval: float = 1.0):
         """建立基线后持续监听，新消息经 on_message 回调。阻塞运行。
-        增量：只处理 rowid 大于基线的新消息，不再每轮全库解密重解析。
+        增量：每轮只看最近 WINDOW_S 秒的消息，用 msg_id 去重判新；不再每轮全库解密重解析。
 
-        健壮性：基线 self._cursors 存在实例上、跨 poll_loop 重启保留——即便本函数因偶发
-        malformed 抛出被外层 5s 后重进，也从上次游标继续，不把基线重置到「当前」而丢掉
-        崩溃窗口内的消息。读失败（撕裂拷贝）只保留 sig 下一轮重试，游标不动故不漏不重。"""
+        为何不用 rowid 游标：QQ 的 40001(=PK=rowid) 是非单调雪花号，`rowid>基线` 会漏掉
+        绝大多数新消息(群消息「TG 收不到」的根因)。改按时间窗口 + 已见 msg_id 集合判新。
+
+        健壮性：基线 self._seen 存在实例上、跨 poll_loop 重启保留——即便本函数因偶发
+        malformed 抛出被外层 5s 后重进，也不重放历史、不漏崩溃窗口内的消息(只要仍在窗口内)。
+        读失败(撕裂拷贝)只保留 sig 下一轮重试，不推进不误判。窗口足够大(默认300s)覆盖重进间隔。"""
         if not self.refresh_key():
             raise RuntimeError("未取到密钥，QQ 可能未登录")
-        # 基线只建一次且必须成功；打不开库时 _max_rowids 返回 None，等拿到自洽快照再进监听，
-        # 绝不用空基线(会把整库历史全重放到 TG)。跨 poll_loop 重启保留，故重进不会重置基线。
-        while self._cursors is None:
-            self._cursors = self._max_rowids()
-            if self._cursors is None:
+        # 基线只建一次且必须成功：把当前窗口内已存在的消息全标记为「已见」，不转发历史。
+        # 打不开库时 _scan_window 返回 None，等拿到快照再进监听；跨 poll_loop 重启保留故不重放。
+        while self._seen is None:
+            snap = self._scan_window(int(time.time()) - WINDOW_S)
+            if snap is None:
                 time.sleep(1.0)
+            else:
+                self._seen = set(snap.keys())
         sig = self._wal_sig()
         while True:
             cur_sig = self._wal_sig()
             if cur_sig != sig:
-                try:
-                    new_msgs, newcur = self._fetch_new(self._cursors)
-                except Exception as e:  # noqa: BLE001  撕裂拷贝等偶发错误
-                    print("[collector] 取新消息失败，保留游标下轮重试:", e, flush=True)
+                cur = self._scan_window(int(time.time()) - WINDOW_S)
+                if cur is None:
                     time.sleep(interval)
-                    continue            # 不推进 sig：下轮 WAL 仍异于 sig，会再取（游标未动，不漏）
-                self._cursors = newcur
+                    continue            # 开库失败：不推进 sig，下轮 WAL 仍异于 sig 会再扫(不漏)
+                new_msgs = [m for k, m in cur.items() if k not in self._seen]
+                # 已见集重置为「当前窗口内的全部 msg_id」：新消息已在上一行据旧 _seen 判出；
+                # 滑出窗口的老消息随之丢弃，内存有界，也不会再被误判为新。
+                self._seen = set(cur.keys())
                 sig = cur_sig
                 for m in sorted(new_msgs, key=lambda m: m.time):
                     if self.on_message:
